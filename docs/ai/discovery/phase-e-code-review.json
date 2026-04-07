@@ -1,0 +1,68 @@
+{
+  "phase": "E",
+  "title": "Design Invariant Verification — Code Review",
+  "reviewer": "kiro-agent",
+  "review_date": "2026-03-17",
+  "status": "COMPLETE",
+
+  "findings": [
+    {
+      "id": "E1",
+      "target": "handler.py normalize_principal_id() (lines 84-96)",
+      "invariant": "exact match only, no wildcard logic",
+      "result": "CONFIRMED",
+      "evidence": "Function implements Candidate F: extracts account ID and role name from assumed-role ARN, returns '<account>#<role-name>'. Fail-closed on non-BedrockUser prefix, BedrockUser-Shared, non-assumed-role ARNs, and empty input. No wildcard, prefix, suffix, contains, regex, or glob matching logic. 11 unit tests pass. Live-verified: derived_principal_id = <ACCOUNT_ID>#BedrockUser-admin.",
+      "code_hash_note": "Candidate F implementation — live-verified (single-user, admin FSx, session botocore-session-1773807868)."
+    },
+    {
+      "id": "E2",
+      "target": "handler.py lookup_principal_policy() (lines 196-208)",
+      "invariant": "DynamoDB GetItem with exact key — no scan, no query, no filter",
+      "result": "CONFIRMED",
+      "evidence": "Uses dynamodb.Table.get_item(Key={'principal_id': principal_id}). DynamoDB GetItem is inherently exact-match on the partition key. No Query, Scan, FilterExpression, or begins_with/contains conditions. A principal_id that does not exactly match a PrincipalPolicy record returns None → deny."
+    },
+    {
+      "id": "E3",
+      "target": "handler.py — all enforcement paths",
+      "invariant": "derived username is NOT used in any enforcement path",
+      "result": "CONFIRMED",
+      "evidence": "Searched entire handler.py for any username extraction from role name (e.g., stripping 'BedrockUser-' prefix). No such logic exists. The raw principal_id (currently userArn) flows through policy lookup, quota check, daily usage update, idempotency, ledger, session metadata, and approval flow without any derived-username transformation. Derived username is a future display/reporting concern only."
+    },
+    {
+      "id": "E4",
+      "target": "iam.tf RequestLedgerDenyMutation statement",
+      "invariant": "RequestLedger is immutable — UpdateItem/DeleteItem explicitly denied",
+      "result": "CONFIRMED",
+      "evidence": "iam.tf contains three DynamoDB policy statements: (1) DynamoDBReadWriteNonLedger — allows GetItem/PutItem/UpdateItem/DeleteItem/Query on all tables EXCEPT RequestLedger. (2) RequestLedgerPutOnly — allows only PutItem on RequestLedger. (3) RequestLedgerDenyMutation — explicit Deny on UpdateItem and DeleteItem for RequestLedger. The explicit Deny overrides any Allow, making the ledger append-only at the IAM level."
+    },
+    {
+      "id": "E5",
+      "target": "dynamodb.tf principal_policy table",
+      "invariant": "PrincipalPolicy PK is principal_id (String) — exact-match by design",
+      "result": "CONFIRMED",
+      "evidence": "dynamodb.tf defines principal_policy table with hash_key = 'principal_id', type = 'S'. No range key, no GSI. All lookups are GetItem on the partition key, which is inherently exact-match. No begins_with, contains, or wildcard-capable access pattern is possible via GetItem."
+    },
+    {
+      "id": "E6",
+      "target": "handler.py — entire codebase",
+      "invariant": "no wildcard, prefix, suffix, or contains matching anywhere",
+      "result": "CONFIRMED",
+      "evidence": "Searched handler.py for: startswith, endswith, 'in ', regex, re.match, re.search, fnmatch, glob, begins_with, contains, BETWEEN, FilterExpression. None found in any enforcement path. All DynamoDB operations use exact-key GetItem or exact-key Query (DailyUsage uses principal_id_date composite key, TemporaryQuotaBoost uses principal_id partition key — both exact match)."
+    }
+  ],
+
+  "summary": {
+    "all_invariants_confirmed": true,
+    "exact_match_only": true,
+    "no_wildcard_logic": true,
+    "no_derived_username_in_enforcement": true,
+    "request_ledger_immutable": true,
+    "principal_policy_exact_key": true
+  },
+
+  "limitations": [
+    "Code review only — no live execution for Phases A-D. Real AWS captures require human operator.",
+    "normalize_principal_id() Candidate F implemented and live-verified (single-user). Cross-user (C2/C3/C5) deferred.",
+    "Cross-environment, cross-role, and fail-closed live validation not yet performed."
+  ]
+}

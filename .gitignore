@@ -1,0 +1,8 @@
+.terraform/
+.build/
+*.tfstate*
+*.tfplan
+tfplan
+.terraform.lock.hcl
+__pycache__/
+*.pyc

@@ -1,0 +1,10 @@
+environment                                = "dev"
+aws_region                                 = "us-west-2"
+ses_sender_email                           = "<SES_SENDER_EMAIL>"
+ses_admin_group_email                      = "<ADMIN_EMAIL>"
+discovery_mode                             = false
+manage_api_gateway_account_cloudwatch_role = false
+api_gateway_data_trace_enabled             = true
+api_gateway_execution_logging_level        = "INFO"
+private_subnet_ids         = ["<PRIVATE_SUBNET_1>", "<PRIVATE_SUBNET_2>"]
+fargate_security_group_ids = ["<SECURITY_GROUP>"]
