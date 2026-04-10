@@ -4,6 +4,32 @@ AWS Bedrock 모델 호출을 중앙 관리하는 게이트웨이. 사용자별 K
 
 ## 아키텍처
 
+### 아키텍처 다이어그램
+
+![Bedrock Gateway architecture overview](./assets/bedrock-gateway/bedrock-gateway-architecture-overview.png)
+
+이 문서는 `260310_Bedrock Gateway 기반 모델 사용 아키텍처` 발표 자료의 아키텍처 정의, 요청 순서, 전체 흐름 슬라이드를 기준으로 현재 저장소 구현과 실제 배포 구성을 정리한 문서다.
+
+### 주요 서비스 관점
+
+<p align="center">
+  <img src="./assets/bedrock-gateway/aws-service-icon.png" alt="AWS service icon extracted from presentation" width="120" />
+</p>
+
+- 인증과 사용자 식별은 `IAM Identity Center`와 Assume Role 흐름을 그대로 유지한다.
+- 모델 호출 제어는 `API Gateway + Lambda Gateway`에서 정책/한도 검증 후 집행한다.
+- 장시간 요청은 `Step Functions + ECS Fargate`로 우회해 사용자 경험을 단일 엔드포인트로 유지한다.
+- 사용량, 가격, 승인, 감사 로그는 `DynamoDB` 계층에서 일관되게 관리한다.
+
+### 설계 의도
+
+- 사용자는 기존 `IAM Identity Center SSO`와 CLI/SDK 프로필을 그대로 사용한다.
+- 모델 호출은 반드시 중앙 `Gateway`를 경유한다.
+- 한도 이내 사용은 별도 승인 없이 바로 허용한다.
+- 예외 승인만 포털에서 처리하고, 알림은 `SES`가 담당한다.
+- 실시간 Quota 차감과 사용량 추적은 `Lambda + DynamoDB`가 담당한다.
+- 장시간 호출은 사용자에게 별도 엔드포인트를 요구하지 않고 내부에서 `Step Functions + Fargate`로 우회한다.
+
 ### v1: Sync Inline (≤29초)
 
 ```
@@ -34,6 +60,46 @@ AWS Bedrock 모델 호출을 중앙 관리하는 게이트웨이. 사용자별 K
 ```
 
 Opus 등 장시간 모델은 서버 측에서 자동으로 async/Fargate 경로로 라우팅. 사용자는 기존 `/converse` 엔드포인트만 호출하면 됨.
+
+### 아키텍처 순서
+
+1. 사용자는 `IAM Identity Center`를 통해 인증한다.
+2. `~/.aws/config`의 Permission Set 기반 프로필로 임시 자격증명을 획득한다.
+3. 클라이언트는 `API Gateway REST API`에 SigV4 서명 요청을 보낸다.
+4. `Lambda`가 호출자 Identity Center 사용자를 식별한다.
+5. `DynamoDB`에서 사용자별 한도, 모델 권한, 남은 예산을 조회하고 차감한다.
+6. 정책을 통과한 요청만 `Bedrock Runtime`으로 전달된다.
+7. 응답은 스트리밍 또는 단건 응답으로 반환된다.
+8. 호출 결과와 사용량은 `CloudWatch`, `request_ledger`, `monthly_usage` 등에 기록된다.
+
+### 전체 흐름 요약
+
+```text
+End Users
+  -> IAM Identity Center / Assume Role
+  -> API Gateway REST API
+  -> Lambda AI Gateway
+  -> DynamoDB Quota / Policy / Ledger
+  -> Bedrock Runtime / Agent Model
+
+Portal / Approval API
+  -> 관리자 승인 처리
+  -> SES 이메일 알림
+
+Long-running requests
+  -> S3 payload
+  -> Step Functions
+  -> ECS Fargate worker
+  -> DynamoDB settlement / S3 result
+```
+
+### 운영 관점 핵심 포인트
+
+- `Gateway`는 정책 집행과 사용량 제어를 담당한다.
+- `Portal`은 승인 처리와 운영 관리 UI를 담당한다.
+- `SES`는 승인 메일과 운영 알림 채널로만 사용한다.
+- `Step Functions + Fargate`는 29초를 넘는 장시간 추론을 분리 처리한다.
+- `DynamoDB`는 Quota, pricing, approval, per-request audit의 단일 운영 저장소 역할을 한다.
 
 ## 실제 배포된 AWS 리소스 (dev 환경, us-west-2)
 
