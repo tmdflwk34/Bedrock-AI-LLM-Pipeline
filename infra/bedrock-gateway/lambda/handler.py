@@ -17,9 +17,11 @@ import json
 import logging
 import os
 import time
+import urllib.parse
 import uuid
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -59,6 +61,7 @@ def _get_team_config_table_name():
 SES_SENDER_EMAIL = os.environ.get("SES_SENDER_EMAIL", "")
 SES_ADMIN_GROUP_EMAIL = os.environ.get("SES_ADMIN_GROUP_EMAIL", "")
 SES_REGION = os.environ.get("SES_REGION", "us-east-1")
+PORTAL_BASE_URL = os.environ.get("PORTAL_BASE_URL", "http://203.0.113.10")
 
 # ---------------------------------------------------------------------------
 # KST Timezone (Q3 decision: KST for all monthly boundaries)
@@ -67,8 +70,11 @@ KST = timezone(timedelta(hours=9))
 
 # ---------------------------------------------------------------------------
 # Model Pricing Cache (cold-start loaded, fail-closed if empty)
+# TTL-based: reloads from DynamoDB every hour to pick up exchange rate updates.
 # ---------------------------------------------------------------------------
 _model_pricing_cache: dict = {}
+_model_pricing_cache_ts: float = 0.0  # epoch seconds when cache was last loaded
+_MODEL_PRICING_CACHE_TTL: int = 3600  # 1 hour
 
 # ---------------------------------------------------------------------------
 # AWS Clients (initialized once per Lambda container)
@@ -301,6 +307,21 @@ def check_model_access(policy: dict, model_id: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Tiered Boost Increment (below 2M: 500K, at/above 2M: 1M)
+# ---------------------------------------------------------------------------
+
+def _get_boost_increment(effective_limit_krw: int) -> int:
+    """Return boost increment based on current effective limit.
+
+    Below 2,000,000 KRW: 500,000 KRW increments
+    At or above 2,000,000 KRW: 1,000,000 KRW increments
+    """
+    if effective_limit_krw >= 2000000:
+        return 1000000
+    return 500000
+
+
+# ---------------------------------------------------------------------------
 # KST Date Helpers (Q3: KST for all monthly boundaries)
 # ---------------------------------------------------------------------------
 
@@ -349,17 +370,20 @@ def _load_model_pricing_cache() -> dict:
 def lookup_model_pricing(model_id: str) -> dict | None:
     """Look up pricing for a model. Returns pricing dict or None (fail-closed).
 
-    Uses cold-start cache. If cache is empty, attempts one reload.
+    Uses TTL-based cache (reloads every _MODEL_PRICING_CACHE_TTL seconds).
     Missing pricing → caller must deny.
     """
-    global _model_pricing_cache
-    if not _model_pricing_cache:
+    global _model_pricing_cache, _model_pricing_cache_ts
+    now = time.time()
+    if not _model_pricing_cache or (now - _model_pricing_cache_ts) > _MODEL_PRICING_CACHE_TTL:
         _model_pricing_cache = _load_model_pricing_cache()
+        _model_pricing_cache_ts = now
     pricing = _model_pricing_cache.get(model_id)
     if pricing is not None:
         return pricing
     # Cache miss — try one reload in case pricing was added after cold start
     _model_pricing_cache = _load_model_pricing_cache()
+    _model_pricing_cache_ts = now
     return _model_pricing_cache.get(model_id)
 
 
@@ -456,8 +480,8 @@ def check_quota(principal_id: str, policy: dict) -> dict:
 
     # Base limit from policy (default 500,000 KRW)
     base_limit = int(policy.get("monthly_cost_limit_krw", 500000))
-    # Hard cap (default 2,000,000 KRW)
-    hard_cap = int(policy.get("max_monthly_cost_limit_krw", 2000000))
+    # Hard cap (default 5,000,000 KRW)
+    hard_cap = int(policy.get("max_monthly_cost_limit_krw", 5000000))
 
     # Check TemporaryQuotaBoost for active KRW boosts
     boost_cost_krw = 0
@@ -502,27 +526,44 @@ def check_quota(principal_id: str, policy: dict) -> dict:
     }
 
 
+class SyncFallbackError(Exception):
+    """Raised when sync path should fall back to async."""
+    pass
+
+# Sync path: no retry, strict time budget.
+# If Bedrock doesn't respond within SYNC_TIMEOUT, we can't retry (already consumed time).
+# Instead, caller catches any error and falls back to async immediately.
+SYNC_TIMEOUT_SECONDS = 20  # Leave 9s buffer for API Gateway 29s limit
+SYNC_FALLBACK_ERRORS = {'ThrottlingException', 'ServiceUnavailableException', 'ServiceException'}
+
+# Bedrock client with short timeout for sync path
+_bedrock_sync = None
+def _get_sync_bedrock_client():
+    global _bedrock_sync
+    if _bedrock_sync is None:
+        from botocore.config import Config as BotoConfig
+        _bedrock_sync = boto3.client("bedrock-runtime", config=BotoConfig(
+            retries={"max_attempts": 0},
+            read_timeout=SYNC_TIMEOUT_SECONDS,
+            connect_timeout=5,
+        ))
+    return _bedrock_sync
+
+
 def invoke_bedrock(model_id: str, request_body: dict) -> dict:
-    """Call Bedrock Converse API (v1: non-streaming only).
+    """Call Bedrock Converse API on sync path.
 
-    Returns {"output": ..., "usage": {"inputTokens": N, "outputTokens": N,
-             "cacheReadInputTokens": N, "cacheWriteInputTokens": N}}.
-    Req 6.1-6.4, 6.6: Converse only, error handling, v1 scope.
+    No retry — single attempt with strict timeout.
+    Raises SyncFallbackError on throttle/timeout → caller falls back to async.
     """
+    converse_params = {"modelId": model_id}
+    for k in ("messages", "system", "inferenceConfig", "toolConfig"):
+        if k in request_body:
+            converse_params[k] = request_body[k]
+
     try:
-        # Build Converse params from request body
-        converse_params = {"modelId": model_id}
-        if "messages" in request_body:
-            converse_params["messages"] = request_body["messages"]
-        if "system" in request_body:
-            converse_params["system"] = request_body["system"]
-        if "inferenceConfig" in request_body:
-            converse_params["inferenceConfig"] = request_body["inferenceConfig"]
-        if "toolConfig" in request_body:
-            converse_params["toolConfig"] = request_body["toolConfig"]
-
-        resp = bedrock_runtime.converse(**converse_params)
-
+        client = _get_sync_bedrock_client()
+        resp = client.converse(**converse_params)
         usage = resp.get("usage", {})
         return {
             "output": resp.get("output", {}),
@@ -535,12 +576,21 @@ def invoke_bedrock(model_id: str, request_body: dict) -> dict:
             "stopReason": resp.get("stopReason", ""),
         }
     except bedrock_runtime.exceptions.ValidationException as e:
-        error_msg = str(e)
-        if "does not support converse" in error_msg.lower():
+        if "does not support converse" in str(e).lower():
             raise ValueError(
                 f"Model {model_id} does not support Converse API. "
                 "Only Converse-compatible models are available in v1."
             )
+        raise
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', '')
+        if error_code in SYNC_FALLBACK_ERRORS:
+            raise SyncFallbackError(f"sync bedrock error: {error_code}")
+        raise
+    except Exception as e:
+        # ReadTimeoutError, ConnectTimeoutError etc → async fallback
+        if "timeout" in str(type(e).__name__).lower() or "timeout" in str(e).lower():
+            raise SyncFallbackError(f"sync timeout: {e}")
         raise
 
 
@@ -683,14 +733,14 @@ def handle_approval_request(principal_id: str, identity_fields: dict,
             "denial_reason": "reason is required and must be non-empty",
         })
 
-    # V2: Validate requested_increment_krw == 500000 (fixed increment)
+    # V2: Validate requested_increment_krw (tiered: 500K below 2M, 1M at/above 2M)
     requested_increment = request_body.get("requested_increment_krw")
     if requested_increment is None:
         log_structured("warning", "approval_missing_increment",
                        principal_id=principal_id, request_id=request_id)
         return _response(400, {
             "decision": "DENY",
-            "denial_reason": "requested_increment_krw is required (must be 500000)",
+            "denial_reason": "requested_increment_krw is required",
         })
     try:
         requested_increment = int(requested_increment)
@@ -699,16 +749,16 @@ def handle_approval_request(principal_id: str, identity_fields: dict,
             "decision": "DENY",
             "denial_reason": "requested_increment_krw must be an integer",
         })
-    if requested_increment != 500000:
+    if requested_increment not in (500000, 1000000):
         log_structured("warning", "approval_wrong_increment",
                        principal_id=principal_id, request_id=request_id,
                        requested=requested_increment)
         return _response(400, {
             "decision": "DENY",
-            "denial_reason": f"requested_increment_krw must be 500000 (got {requested_increment})",
+            "denial_reason": f"requested_increment_krw must be 500000 or 1000000 (got {requested_increment})",
         })
 
-    # V3: Hard cap pre-validation (effective + 500K <= 2M)
+    # V3: Hard cap pre-validation (tiered increment, max 5M)
     try:
         policy = lookup_principal_policy(principal_id)
     except Exception as e:
@@ -719,7 +769,7 @@ def handle_approval_request(principal_id: str, identity_fields: dict,
     if not policy:
         return deny_response("no policy defined for principal")
 
-    hard_cap = int(policy.get("max_monthly_cost_limit_krw", 2000000))
+    hard_cap = int(policy.get("max_monthly_cost_limit_krw", 5000000))
     base_limit = int(policy.get("monthly_cost_limit_krw", 500000))
 
     # Calculate current effective limit (same formula as check_quota)
@@ -817,7 +867,7 @@ def handle_approval_request(principal_id: str, identity_fields: dict,
 def _send_approval_email(principal_id: str, approval_id: str,
                          reason: str, current_limit_krw: int = 0,
                          requested_new_limit_krw: int = 0,
-                         hard_cap_krw: int = 2000000,
+                         hard_cap_krw: int = 5000000,
                          action_token: str = "") -> None:
     """Send approval email with Outlook Actionable Message (Adaptive Card).
 
@@ -947,7 +997,7 @@ def _auto_create_approval_request(principal_id: str, identity_fields: dict,
     inference and creates the request on behalf of the user.
     Returns approval_id if created, None if skipped (lock exists, hard cap, etc).
     """
-    increment = 500000
+    increment = _get_boost_increment(current_effective)
     new_effective = current_effective + increment
 
     # Hard cap check
@@ -1006,82 +1056,251 @@ def _auto_create_approval_request(principal_id: str, identity_fields: dict,
 
 
 # ---------------------------------------------------------------------------
-# User Warning Emails — 30% / 10% remaining threshold
+# User Warning Emails — 90% warning + 100% exhaustion per band
 # ---------------------------------------------------------------------------
+#
+# Per-band email schedule:
+#   - Non-final bands (effective_limit < hard_cap):
+#       90% usage → 한도증액요청 메일 (with increase button)
+#      100% usage → 한도증액요청 메일 한번 더 (with increase button)
+#   - Final band (effective_limit == hard_cap):
+#       90% usage → 경고 메일 (증액 불가)
+#      100% usage → 이번달 전부 소진 메일
+#
+# Dedup keys on principal-policy item (keyed to effective_limit value):
+#   - warning_90pct_sent_for_limit  → one 90% email per effective_limit
+#   - exhaustion_email_sent_for_limit → one 100% email per effective_limit
+#
+# Both keys are REMOVED when:
+#   - Admin approves increase (approve_request)
+#   - Admin direct boost (admin_direct_boost)
+#   - Email-based approval (email_action_approve)
+# ---------------------------------------------------------------------------
+
 
 def _check_and_send_warning_email(principal_id: str, policy: dict,
                                   usage_krw: float, effective_limit: int) -> None:
-    """Check if user's remaining allowance in the CURRENT BAND SLICE crossed 30% or 10%.
+    """Check usage thresholds and send appropriate warning/exhaustion emails.
 
-    Band slices are 500K KRW each: 0-500K, 500K-1M, 1M-1.5M, 1.5M-2M.
-    Warnings are based on remaining room within the current active band slice,
-    not the total effective limit.
+    Two thresholds per band:
+      1) 90% of effective_limit → warning email (dedup: warning_90pct_sent_for_limit)
+      2) 100% of effective_limit → exhaustion email (dedup: exhaustion_email_sent_for_limit)
 
-    Dedup via warning_30pct_sent_for_limit / warning_10pct_sent_for_limit
-    on principal-policy item, keyed to effective_limit value.
+    For non-final bands: both emails include 한도증액요청 button.
+    For final band (effective_limit == hard_cap): 90% = warning only, 100% = 소진 알림.
     """
     if effective_limit <= 0:
         return
 
-    hard_cap = int(policy.get("max_monthly_cost_limit_krw", 2000000))
-    band_size = 500000
-
-    # Compute current band slice floor/ceiling
-    # effective_limit is always a multiple of band_size (500K, 1M, 1.5M, 2M)
-    band_ceiling = effective_limit
-    band_floor = max(0, effective_limit - band_size)
-
-    # Remaining within the current band slice
-    usage_in_band = max(0, usage_krw - band_floor)
-    remaining_in_band = max(0, band_size - usage_in_band)
-    if band_size > 0:
-        remaining_pct_in_band = remaining_in_band / band_size
-    else:
+    # Skip for direct-access exception users
+    if policy.get("direct_access_exception") is True:
+        log_structured("info", "warning_email_skip_exception", principal_id=principal_id)
         return
 
-    send_30 = remaining_pct_in_band <= 0.30
-    send_10 = remaining_pct_in_band <= 0.10
+    remaining = max(0, effective_limit - usage_krw)
+    remaining_pct = remaining / effective_limit
+    usage_pct = usage_krw / effective_limit * 100
 
-    if not send_30 and not send_10:
-        return
+    # Determine which thresholds are crossed
+    crossed_100 = usage_krw >= effective_limit
+    crossed_90 = usage_pct >= 90.0  # remaining_pct <= 0.10
 
-    already_sent_30_for = policy.get("warning_30pct_sent_for_limit")
-    already_sent_10_for = policy.get("warning_10pct_sent_for_limit")
-    if isinstance(already_sent_30_for, Decimal):
-        already_sent_30_for = int(already_sent_30_for)
-    if isinstance(already_sent_10_for, Decimal):
-        already_sent_10_for = int(already_sent_10_for)
+    if not crossed_90:
+        return  # Not yet at any threshold
 
-    need_30 = send_30 and already_sent_30_for != effective_limit
-    need_10 = send_10 and already_sent_10_for != effective_limit
+    # Read dedup flags
+    sent_90_for = policy.get("warning_90pct_sent_for_limit")
+    if isinstance(sent_90_for, Decimal):
+        sent_90_for = int(sent_90_for)
+    # Legacy compat: also check old key name
+    if sent_90_for is None:
+        sent_90_for = policy.get("warning_10pct_sent_for_limit")
+        if isinstance(sent_90_for, Decimal):
+            sent_90_for = int(sent_90_for)
 
-    if not need_30 and not need_10:
-        return
+    sent_100_for = policy.get("exhaustion_email_sent_for_limit")
+    if isinstance(sent_100_for, Decimal):
+        sent_100_for = int(sent_100_for)
 
+    already_sent_90 = (sent_90_for == effective_limit)
+    already_sent_100 = (sent_100_for == effective_limit)
+
+    # Decide which email to send (prefer 100% over 90% if both crossed)
+    if crossed_100 and not already_sent_100:
+        _send_band_email(principal_id, policy, usage_krw, effective_limit,
+                         threshold_type="exhaustion")
+    elif crossed_90 and not already_sent_90:
+        _send_band_email(principal_id, policy, usage_krw, effective_limit,
+                         threshold_type="warning_90")
+
+
+def _send_band_email(principal_id: str, policy: dict,
+                     usage_krw: float, effective_limit: int,
+                     threshold_type: str) -> None:
+    """Send a single band-level email (90% warning or 100% exhaustion).
+
+    threshold_type: "warning_90" or "exhaustion"
+
+    Email content varies by:
+      - threshold_type (90% vs 100%)
+      - is_final_band (effective_limit == hard_cap)
+    """
     user_email = policy.get("notification_email", "")
     if not user_email or not SES_SENDER_EMAIL:
-        log_structured("warning", "warning_email_no_recipient",
-                       principal_id=principal_id)
+        log_structured("warning", "band_email_no_recipient",
+                       principal_id=principal_id, threshold_type=threshold_type)
         return
 
     username = principal_id.split("#")[-1] if "#" in principal_id else principal_id
+    hard_cap = int(policy.get("max_monthly_cost_limit_krw", 5000000))
+    band_size = _get_boost_increment(effective_limit)
+    new_limit = effective_limit + band_size
+    is_final_band = (effective_limit >= hard_cap)
+    can_increase = not is_final_band
+    has_pending = _check_pending_lock(principal_id)
 
-    if need_10:
-        threshold_label = "10%"
-        subject = f"[Bedrock Gateway] 사용량 알림: 현재 밴드 잔여 {threshold_label} 이하"
-        guidance = (
-            "현재 밴드 한도가 거의 소진되었습니다.\n"
-            "한도 소진 시 추가 요청이 필요하며, 터미널에서 안내에 따라 증액을 요청할 수 있습니다."
-        )
-    elif need_30:
-        threshold_label = "30%"
-        subject = f"[Bedrock Gateway] 사용량 알림: 현재 밴드 잔여 {threshold_label} 이하"
-        guidance = "현재 밴드 사용량이 70%를 넘었습니다. 참고하시기 바랍니다."
+    remaining = max(0, effective_limit - usage_krw)
+    remaining_pct = remaining / effective_limit if effective_limit > 0 else 0
+    usage_pct = usage_krw / effective_limit * 100 if effective_limit > 0 else 0
+
+    # --- Determine subject, guidance, button ---
+    if threshold_type == "exhaustion":
+        if is_final_band:
+            # Final band 100%: 이번달 전부 소진
+            subject = "[Bedrock Gateway] 월간 한도 전부 소진 — 요청 차단됨"
+            guidance_html = (
+                f"이번 달 월간 최대 한도(KRW {hard_cap:,})를 전부 소진하였습니다. "
+                "추가 증액이 불가하며, 다음 달 초에 한도가 초기화됩니다."
+            )
+            guidance_text = guidance_html
+            button_html = ""
+            header_title = "Bedrock Gateway 월간 한도 소진 알림"
+            header_color = "#d9534f"
+            status_msg = f"월간 최대 한도(KRW {hard_cap:,})를 전부 소진하였습니다."
+        else:
+            # Non-final band 100%: 한도증액요청 메일
+            subject = "[Bedrock Gateway] 한도 소진 — 요청 차단됨"
+            header_title = "Bedrock Gateway 한도 소진 알림"
+            header_color = "#d9534f"
+            status_msg = "한도 초과로 인해 Bedrock 요청이 차단되었습니다."
+            if can_increase and not has_pending:
+                try:
+                    action_token = str(uuid.uuid4())
+                    _store_action_token(principal_id, action_token)
+                    increase_url = (
+                        f"{PORTAL_BASE_URL}/api/gateway/increase-request"
+                        f"?principal_id={urllib.parse.quote(principal_id)}"
+                        f"&token={action_token}"
+                    )
+                    button_html = (
+                        f'<div style="margin: 24px 0;">'
+                        f'<a href="{increase_url}" style="display: inline-block; padding: 12px 32px; '
+                        f'background: #007bff; color: white; text-decoration: none; border-radius: 6px; '
+                        f'font-size: 16px; font-weight: bold;">한도 증액 요청</a></div>'
+                    )
+                    guidance_html = "한도가 소진되어 Bedrock 요청이 차단되었습니다. 아래 버튼을 클릭하면 관리자에게 한도 증액 승인 요청이 전송됩니다."
+                    guidance_text = f"한도가 소진되어 Bedrock 요청이 차단되었습니다.\n한도 증액 요청: {increase_url}"
+                except Exception as e:
+                    log_structured("error", "band_email_increase_link_failed",
+                                   principal_id=principal_id, error=str(e))
+                    button_html = ""
+                    guidance_html = "한도가 소진되어 Bedrock 요청이 차단되었습니다. 포털(Bedrock Gateway 페이지)에서 한도 증액을 요청할 수 있습니다."
+                    guidance_text = guidance_html
+            elif has_pending:
+                button_html = ""
+                guidance_html = "한도 증액 요청이 관리자 승인 대기 중입니다."
+                guidance_text = guidance_html
+            else:
+                button_html = ""
+                guidance_html = f"월간 최대 한도(KRW {hard_cap:,})에 도달하여 추가 증액이 불가합니다."
+                guidance_text = guidance_html
     else:
-        return
+        # threshold_type == "warning_90"
+        if is_final_band:
+            # Final band 90%: 경고 (증액 불가)
+            subject = f"[Bedrock Gateway] 사용량 경고: 한도의 {usage_pct:.0f}% 사용 (증액 불가)"
+            header_title = "Bedrock Gateway 사용량 경고"
+            header_color = "#333"
+            status_msg = f"현재 적용 한도의 {usage_pct:.0f}%를 사용하였습니다. (잔여 {remaining_pct*100:.0f}%)"
+            button_html = ""
+            guidance_html = (
+                f"월간 최대 한도(KRW {hard_cap:,})에 도달하여 추가 증액이 불가합니다. "
+                "잔여 한도를 초과하면 Bedrock 요청이 차단됩니다."
+            )
+            guidance_text = guidance_html
+        else:
+            # Non-final band 90%: 한도증액요청 메일
+            subject = f"[Bedrock Gateway] 사용량 알림: 한도의 {usage_pct:.0f}% 사용 (잔여 {remaining_pct*100:.0f}%)"
+            header_title = "Bedrock Gateway 사용량 알림"
+            header_color = "#333"
+            status_msg = f"현재 적용 한도의 {usage_pct:.0f}%를 사용하였습니다. (잔여 {remaining_pct*100:.0f}%)"
+            if can_increase and not has_pending:
+                try:
+                    action_token = str(uuid.uuid4())
+                    _store_action_token(principal_id, action_token)
+                    increase_url = (
+                        f"{PORTAL_BASE_URL}/api/gateway/increase-request"
+                        f"?principal_id={urllib.parse.quote(principal_id)}"
+                        f"&token={action_token}"
+                    )
+                    button_html = (
+                        f'<div style="margin: 24px 0;">'
+                        f'<a href="{increase_url}" style="display: inline-block; padding: 12px 32px; '
+                        f'background: #007bff; color: white; text-decoration: none; border-radius: 6px; '
+                        f'font-size: 16px; font-weight: bold;">한도 증액 요청</a></div>'
+                    )
+                    guidance_html = "한도가 거의 소진되었습니다. 아래 버튼을 클릭하면 관리자에게 한도 증액 승인 요청이 전송됩니다."
+                    guidance_text = f"한도가 거의 소진되었습니다.\n한도 증액 요청: {increase_url}"
+                except Exception as e:
+                    log_structured("error", "band_email_increase_link_failed",
+                                   principal_id=principal_id, error=str(e))
+                    button_html = ""
+                    guidance_html = "한도가 거의 소진되었습니다. 포털(Bedrock Gateway 페이지)에서 한도 증액을 요청할 수 있습니다."
+                    guidance_text = guidance_html
+            elif has_pending:
+                button_html = ""
+                guidance_html = "한도 증액 요청이 관리자 승인 대기 중입니다."
+                guidance_text = guidance_html
+            else:
+                button_html = ""
+                guidance_html = f"월간 최대 한도(KRW {hard_cap:,})에 도달하여 추가 증액이 불가합니다."
+                guidance_text = guidance_html
 
-    total_remaining = max(0, effective_limit - usage_krw)
+    # --- Build email body (same HTML template as before) ---
+    html_body = f"""<html><head></head><body style="font-family: sans-serif; max-width: 600px;">
+<h2 style="color: {header_color};">{header_title}</h2>
+<p style="color: #d9534f; font-weight: bold;">{status_msg}</p>
+<table style="border-collapse: collapse; width: 100%; margin: 16px 0;">
+<tr><td style="padding: 8px; border: 1px solid #ddd; background: #f9f9f9; width: 40%;"><b>사용자</b></td>
+<td style="padding: 8px; border: 1px solid #ddd;">{username}</td></tr>
+<tr><td style="padding: 8px; border: 1px solid #ddd; background: #f9f9f9;"><b>현재 적용 한도</b></td>
+<td style="padding: 8px; border: 1px solid #ddd;">KRW {effective_limit:,}</td></tr>
+<tr><td style="padding: 8px; border: 1px solid #ddd; background: #f9f9f9;"><b>총 사용 금액</b></td>
+<td style="padding: 8px; border: 1px solid #ddd;">KRW {usage_krw:,.0f} ({usage_pct:.1f}%)</td></tr>
+<tr><td style="padding: 8px; border: 1px solid #ddd; background: #f9f9f9;"><b>잔여 한도</b></td>
+<td style="padding: 8px; border: 1px solid #ddd;">KRW {remaining:,.0f} ({remaining_pct*100:.1f}%)</td></tr>
+<tr><td style="padding: 8px; border: 1px solid #ddd; background: #f9f9f9;"><b>승인 시 새 한도</b></td>
+<td style="padding: 8px; border: 1px solid #ddd;"><b>KRW {new_limit:,}</b></td></tr>
+<tr><td style="padding: 8px; border: 1px solid #ddd; background: #f9f9f9;"><b>월간 최대 한도</b></td>
+<td style="padding: 8px; border: 1px solid #ddd;">KRW {hard_cap:,}</td></tr>
+</table>
+<p>{guidance_html}</p>
+{button_html}
+<p style="color: #999; font-size: 11px;">이 메일은 Bedrock Gateway에서 자동 발송되었습니다.</p>
+</body></html>"""
 
+    text_body = (
+        f"{header_title}\n"
+        f"{'='*50}\n\n"
+        f"사용자: {username}\n\n"
+        f"현재 적용 한도: KRW {effective_limit:,}\n"
+        f"총 사용 금액: KRW {usage_krw:,.0f} ({usage_pct:.1f}%)\n"
+        f"잔여 한도: KRW {remaining:,.0f} ({remaining_pct*100:.1f}%)\n"
+        f"월간 최대 한도: KRW {hard_cap:,}\n\n"
+        f"{guidance_text}\n"
+    )
+
+    # --- Send email ---
     try:
         ses_client.send_email(
             Source=SES_SENDER_EMAIL,
@@ -1089,57 +1308,136 @@ def _check_and_send_warning_email(principal_id: str, policy: dict,
             Message={
                 "Subject": {"Data": subject},
                 "Body": {
-                    "Text": {
-                        "Data": (
-                            f"Bedrock Gateway 사용량 알림\n"
-                            f"{'='*50}\n\n"
-                            f"사용자: {username}\n\n"
-                            f"현재 밴드: KRW {band_floor:,} ~ {band_ceiling:,} (밴드 크기 KRW {band_size:,})\n"
-                            f"밴드 내 사용 금액: KRW {usage_in_band:,.0f}\n"
-                            f"밴드 내 잔여 한도: KRW {remaining_in_band:,.0f} ({remaining_pct_in_band*100:.0f}%)\n"
-                            f"알림 기준: 밴드 잔여 {threshold_label} 이하\n\n"
-                            f"전체 현황:\n"
-                            f"  현재 적용 한도: KRW {effective_limit:,}\n"
-                            f"  총 사용 금액: KRW {usage_krw:,.0f}\n"
-                            f"  총 잔여 한도: KRW {total_remaining:,.0f}\n"
-                            f"  월간 최대 한도: KRW {hard_cap:,}\n\n"
-                            f"{guidance}\n"
-                        ),
-                    },
+                    "Text": {"Data": text_body},
+                    "Html": {"Data": html_body},
                 },
             },
         )
-        log_structured("info", "warning_email_sent",
-                       principal_id=principal_id, threshold=threshold_label,
-                       band_floor=band_floor, band_ceiling=band_ceiling,
-                       remaining_in_band=remaining_in_band,
-                       effective_limit=effective_limit)
+        log_structured("info", "band_email_sent",
+                       principal_id=principal_id,
+                       threshold_type=threshold_type,
+                       usage_krw=usage_krw, remaining_krw=remaining,
+                       remaining_pct=remaining_pct,
+                       effective_limit=effective_limit,
+                       is_final_band=is_final_band)
     except Exception as e:
-        log_structured("error", "warning_email_failed",
-                       principal_id=principal_id, threshold=threshold_label,
-                       error=str(e))
+        log_structured("error", "band_email_failed",
+                       principal_id=principal_id,
+                       threshold_type=threshold_type, error=str(e))
         return
 
-    # Update dedup state — mark both thresholds if both crossed
+    # --- Update dedup state ---
     try:
         policy_table = dynamodb.Table(TABLE_PRINCIPAL_POLICY)
-        update_expr_parts = []
-        expr_values = {}
-        if need_30 or send_30:
-            update_expr_parts.append("warning_30pct_sent_for_limit = :w30")
-            expr_values[":w30"] = effective_limit
-        if need_10 or send_10:
-            update_expr_parts.append("warning_10pct_sent_for_limit = :w10")
-            expr_values[":w10"] = effective_limit
-        if update_expr_parts:
+        if threshold_type == "exhaustion":
             policy_table.update_item(
                 Key={"principal_id": principal_id},
-                UpdateExpression="SET " + ", ".join(update_expr_parts),
-                ExpressionAttributeValues=expr_values,
+                UpdateExpression="SET exhaustion_email_sent_for_limit = :val",
+                ExpressionAttributeValues={":val": effective_limit},
+            )
+        else:
+            # warning_90 — also set legacy key for backward compat
+            policy_table.update_item(
+                Key={"principal_id": principal_id},
+                UpdateExpression="SET warning_90pct_sent_for_limit = :w90, warning_10pct_sent_for_limit = :w90",
+                ExpressionAttributeValues={":w90": effective_limit},
             )
     except Exception as e:
-        log_structured("error", "warning_dedup_update_failed",
+        log_structured("error", "band_email_dedup_update_failed",
+                       principal_id=principal_id,
+                       threshold_type=threshold_type, error=str(e))
+
+
+
+# ---------------------------------------------------------------------------
+# Exhaustion Email — sent when quota is exhausted (429 path)
+# Delegates to _send_band_email for consistent behavior.
+# ---------------------------------------------------------------------------
+
+def _send_exhaustion_email(principal_id: str, policy: dict,
+                           usage_krw: float, effective_limit: int) -> None:
+    """Send quota exhaustion email (called from 429 response path).
+
+    Delegates to _send_band_email with threshold_type="exhaustion".
+    Handles dedup, direct_access_exception, and missing recipient checks
+    inside _send_band_email / _check_and_send_warning_email.
+
+    Non-fatal: all errors caught and logged, never raises.
+    """
+    try:
+        if effective_limit <= 0:
+            return
+        if policy.get("direct_access_exception") is True:
+            log_structured("info", "exhaustion_email_skip_exception",
+                           principal_id=principal_id)
+            return
+
+        # Dedup check
+        already_sent_for = policy.get("exhaustion_email_sent_for_limit")
+        if isinstance(already_sent_for, Decimal):
+            already_sent_for = int(already_sent_for)
+        if already_sent_for == effective_limit:
+            log_structured("info", "exhaustion_email_dedup_skip",
+                           principal_id=principal_id,
+                           effective_limit=effective_limit)
+            return
+
+        _send_band_email(principal_id, policy, usage_krw, effective_limit,
+                         threshold_type="exhaustion")
+    except Exception as e:
+        log_structured("error", "exhaustion_email_failed",
                        principal_id=principal_id, error=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Action Token & Pending Lock Helpers (email-based approval request)
+# ---------------------------------------------------------------------------
+
+def _store_action_token(principal_id: str, token: str) -> None:
+    """Store increase_action_token + TTL (7 days) in principal-policy table.
+
+    Uses atomic UpdateExpression to set both attributes in a single call.
+    Fail-safe: logs error on failure but does NOT raise.
+    """
+    try:
+        ttl = int(time.time()) + 604800  # 7 days in seconds
+        policy_table = dynamodb.Table(TABLE_PRINCIPAL_POLICY)
+        policy_table.update_item(
+            Key={"principal_id": principal_id},
+            UpdateExpression="SET increase_action_token = :tok, increase_action_token_ttl = :ttl",
+            ExpressionAttributeValues={
+                ":tok": token,
+                ":ttl": ttl,
+            },
+        )
+        log_structured("info", "action_token_stored",
+                       principal_id=principal_id, ttl=ttl)
+    except Exception as e:
+        log_structured("error", "action_token_store_failed",
+                       principal_id=principal_id, error=str(e))
+
+
+def _check_pending_lock(principal_id: str) -> bool:
+    """Check if an active approval-pending-lock exists for the principal.
+
+    Returns True if a non-expired lock exists, False otherwise.
+    Fail-open: on any exception returns False (log warning).
+    Duplicate requests are ultimately prevented at lock acquisition time.
+    """
+    try:
+        lock_table = dynamodb.Table(TABLE_APPROVAL_PENDING_LOCK)
+        resp = lock_table.get_item(Key={"principal_id": principal_id})
+        item = resp.get("Item")
+        if not item:
+            return False
+        lock_ttl = item.get("ttl", 0)
+        if isinstance(lock_ttl, Decimal):
+            lock_ttl = int(lock_ttl)
+        return int(lock_ttl) > int(time.time())
+    except Exception as e:
+        log_structured("warning", "pending_lock_check_failed",
+                       principal_id=principal_id, error=str(e))
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1174,8 +1472,8 @@ def handle_quota_status(principal_id: str, identity_fields: dict) -> dict:
     usage_krw = quota_result["usage"]["cost_krw"]
     effective_limit = int(quota_result["limit"]["cost_krw"])
     base_limit = int(policy.get("monthly_cost_limit_krw", 500000))
-    hard_cap = int(policy.get("max_monthly_cost_limit_krw", 2000000))
-    increment = 500000
+    hard_cap = int(policy.get("max_monthly_cost_limit_krw", 5000000))
+    increment = _get_boost_increment(effective_limit)
 
     # Active boost calculation (same as check_quota internals)
     active_boost_krw = max(0, effective_limit - base_limit)
@@ -1703,13 +2001,15 @@ def _release_semaphore_slot(job_id: str) -> None:
 #
 # Category 3/4 — size-based: any model can be slow with large input/output.
 # ---------------------------------------------------------------------------
-ASYNC_MAX_TOKENS_THRESHOLD = 8192    # maxTokens >= 8K → async (lowered from 16K)
+ASYNC_MAX_TOKENS_THRESHOLD = 4096    # maxTokens >= 8K → async (lowered from 16K)
 ASYNC_INPUT_SIZE_THRESHOLD = 100000  # input body > ~100KB → async (lowered from 200KB)
 
 # Models that ALWAYS route to async regardless of input size.
 # These are known to routinely exceed 29s even for trivial inputs.
 ALWAYS_ASYNC_MODELS = {
     # Opus variants (always slow, 30-120s typical)
+    "us.anthropic.claude-opus-4-7",
+    "global.anthropic.claude-opus-4-7",
     "us.anthropic.claude-opus-4-6-v1",
     "global.anthropic.claude-opus-4-6-v1",
     "us.anthropic.claude-opus-4-5-20251101-v1:0",
@@ -1742,30 +2042,23 @@ SLOW_MODEL_PATTERNS = [
 def _should_route_async(model_id: str, body: dict) -> tuple:
     """Determine if a /converse request should be routed to async path.
 
-    Returns (should_async: bool, reason: str) for structured logging.
-    Decision table (evaluated in order, first match wins):
-      1. model_id in ALWAYS_ASYNC_MODELS     → async (reason: always_async_model)
-      2. model_id matches SLOW_MODEL_PATTERNS → async (reason: slow_model_pattern)
-      3. maxTokens >= 8192                    → async (reason: max_tokens_N)
-      4. messages+system JSON > 100KB         → async (reason: input_size_N)
-      5. otherwise                            → sync
+    Returns (should_async: bool, reason: str).
+    Known slow models (opus, deepseek-r1, nova-premier) always async.
+    Other models start sync by default. Async only for large input/output.
+    Sync throttle errors are caught by caller and fall back to async.
     """
-    # 1. Exact match — known always-slow models
-    if model_id in ALWAYS_ASYNC_MODELS:
-        return True, "always_async_model"
-
-    # 2. Pattern match — catch cross-region/versioned variants
+    # 1. Known slow models — always async (routinely exceed 29s)
     model_lower = model_id.lower()
     for pattern in SLOW_MODEL_PATTERNS:
         if pattern in model_lower:
-            return True, f"slow_model_pattern_{pattern}"
+            return True, f"slow_model_{pattern}"
 
-    # 3. Large output request
+    # 2. Large output request
     max_tokens = (body.get("inferenceConfig") or {}).get("maxTokens", 0)
     if isinstance(max_tokens, (int, float)) and max_tokens >= ASYNC_MAX_TOKENS_THRESHOLD:
         return True, f"max_tokens_{int(max_tokens)}"
 
-    # 4. Large input context
+    # 3. Large input context
     input_size = len(json.dumps(body.get("messages", []), ensure_ascii=False))
     system = body.get("system")
     if system:
@@ -1824,6 +2117,34 @@ def handle_converse_job_submit(principal_id: str, identity_fields: dict,
     if not quota_result["allowed"]:
         return _response(429, {"decision": "DENY", "denial_reason": "monthly cost quota exceeded"})
 
+    # Per-user active job count check — BEFORE creating any records
+    if TABLE_JOB_STATE:
+        try:
+            _job_table = dynamodb.Table(TABLE_JOB_STATE)
+            active_resp = _job_table.query(
+                IndexName="principal-created-index",
+                KeyConditionExpression="principal_id = :pid",
+                FilterExpression="#s IN (:s1, :s2, :s3)",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={
+                    ":pid": principal_id,
+                    ":s1": "ACCEPTED", ":s2": "QUEUED", ":s3": "RUNNING",
+                },
+                Select="COUNT",
+            )
+            active_count = active_resp.get("Count", 0)
+            if active_count >= PER_USER_ACTIVE_LIMIT:
+                log_structured("warning", "per_user_active_limit",
+                               principal_id=principal_id, active=active_count)
+                return _response(429, {
+                    "decision": "DENY",
+                    "denial_reason": f"per-user active job limit reached ({active_count}/{PER_USER_ACTIVE_LIMIT})",
+                    "active_jobs": active_count,
+                })
+        except Exception as e:
+            log_structured("error", "active_count_check_failed", principal_id=principal_id, error=str(e))
+            # fail-open: allow submission if count check fails
+
     # Idempotency check
     try:
         cached = check_idempotency(request_id)
@@ -1842,6 +2163,12 @@ def handle_converse_job_submit(principal_id: str, identity_fields: dict,
     reserve_krw = min(est_cost * Decimal("2"), Decimal("100000"))
     remaining = Decimal(str(quota_result["remaining"]["cost_krw"]))
     if reserve_krw > remaining:
+        # Send exhaustion email — user needs to know they're blocked and can request increase
+        try:
+            _send_exhaustion_email(principal_id, policy, float(Decimal(str(quota_result["usage"]["cost_krw"]))),
+                                   int(quota_result["limit"]["cost_krw"]))
+        except Exception:
+            pass
         return _response(429, {"decision": "DENY", "denial_reason": f"estimated cost ({float(reserve_krw):.0f} KRW) exceeds remaining budget ({float(remaining):.0f} KRW). Request a quota increase."})
     if reserve_krw <= 0:
         return _response(429, {"decision": "DENY", "denial_reason": "insufficient budget for reservation"})
@@ -1932,34 +2259,6 @@ def handle_converse_job_submit(principal_id: str, identity_fields: dict,
         })
     except Exception as e:
         log_structured("error", "ledger_accepted_failed", job_id=job_id, error=str(e))
-
-    # Per-user active job count check (soft limit, not global hard cap)
-    # Allows burst up to PER_USER_ACTIVE_LIMIT per user; no global semaphore.
-    if TABLE_JOB_STATE:
-        try:
-            active_resp = job_table.query(
-                IndexName="principal-created-index",
-                KeyConditionExpression="principal_id = :pid",
-                FilterExpression="#s IN (:s1, :s2, :s3)",
-                ExpressionAttributeNames={"#s": "status"},
-                ExpressionAttributeValues={
-                    ":pid": principal_id,
-                    ":s1": "ACCEPTED", ":s2": "QUEUED", ":s3": "RUNNING",
-                },
-                Select="COUNT",
-            )
-            active_count = active_resp.get("Count", 0)
-            if active_count >= PER_USER_ACTIVE_LIMIT:
-                log_structured("warning", "per_user_active_limit",
-                               job_id=job_id, principal_id=principal_id, active=active_count)
-                return _response(429, {
-                    "decision": "DENY",
-                    "denial_reason": f"per-user active job limit reached ({active_count}/{PER_USER_ACTIVE_LIMIT})",
-                    "job_id": job_id, "active_jobs": active_count,
-                })
-        except Exception as e:
-            log_structured("error", "active_count_check_failed", job_id=job_id, error=str(e))
-            # fail-open: allow submission if count check fails
 
     sfn_execution_arn = ""
     # Enqueue to SQS job queue (dispatcher will start SFN after checking limits)
@@ -2230,6 +2529,70 @@ def _cleanup_stale_reservations(principal_id: str, month: str) -> int:
     return cleaned
 
 # ---------------------------------------------------------------------------
+# Internal Warning Check Handler (async settlement path)
+# ---------------------------------------------------------------------------
+
+def _handle_warning_check(event: dict) -> dict:
+    """Handle warning-check internal route invoked by Worker after settlement.
+
+    Extracts principal_id and usage from event, queries policy and boost tables,
+    then delegates to _check_and_send_warning_email.
+    """
+    principal_id = event.get("principal_id", "")
+    usage_krw = float(event.get("usage_after_settlement_krw", 0))
+    source = event.get("source", "unknown")
+    job_id = event.get("job_id", "")
+
+    log_structured("info", "warning_check_start",
+                   principal_id=principal_id, usage_krw=usage_krw,
+                   source=source, job_id=job_id)
+
+    try:
+        # Query principal-policy table
+        policy_table = dynamodb.Table(TABLE_PRINCIPAL_POLICY)
+        resp = policy_table.get_item(Key={"principal_id": principal_id})
+        policy = resp.get("Item")
+        if not policy:
+            log_structured("warning", "warning_check_no_policy",
+                           principal_id=principal_id, job_id=job_id)
+            return {"status": "skip", "reason": "no_policy"}
+
+        # Calculate effective_limit (base + active TemporaryQuotaBoost)
+        base_limit = int(policy.get("monthly_cost_limit_krw", 500000))
+        hard_cap = int(policy.get("max_monthly_cost_limit_krw", 5000000))
+
+        boost_cost_krw = 0
+        now_epoch = int(time.time())
+        boost_table = dynamodb.Table(TABLE_TEMPORARY_QUOTA_BOOST)
+        try:
+            boost_resp = boost_table.query(
+                KeyConditionExpression="principal_id = :pid",
+                ExpressionAttributeValues={":pid": principal_id},
+            )
+            for item in boost_resp.get("Items", []):
+                ttl_val = int(item.get("ttl", 0))
+                if ttl_val > now_epoch:
+                    boost_cost_krw += int(item.get("extra_cost_krw", 0))
+        except Exception as e:
+            log_structured("error", "warning_check_boost_lookup_failed",
+                           principal_id=principal_id, error=str(e))
+
+        effective_limit = min(base_limit + boost_cost_krw, hard_cap)
+
+        _check_and_send_warning_email(principal_id, policy, usage_krw, effective_limit)
+
+        log_structured("info", "warning_check_complete",
+                       principal_id=principal_id, job_id=job_id,
+                       effective_limit=effective_limit)
+        return {"status": "success"}
+
+    except Exception as e:
+        log_structured("error", "warning_check_failed",
+                       principal_id=principal_id, job_id=job_id, error=str(e))
+        return {"status": "error", "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
 # Main Handler
 # ---------------------------------------------------------------------------
 
@@ -2256,6 +2619,10 @@ def lambda_handler(event: dict, context) -> dict:
 
     log_structured("info", "request_received",
                    request_id=request_id, method=http_method, path=path)
+
+    # Internal routes (Lambda direct invoke, not via API Gateway)
+    if event.get("_internal_route") == "warning-check":
+        return _handle_warning_check(event)
 
     # --- Discovery mode (Task 3) ---
     if DISCOVERY_MODE:
@@ -2324,6 +2691,14 @@ def lambda_handler(event: dict, context) -> dict:
     if path.rstrip("/").endswith("/cancel") and "/converse-jobs/" in path and http_method == "POST":
         return handle_converse_job_cancel(principal_id, path, request_id)
 
+    # --- Route: /invoke — InvokeModel passthrough (image / embedding / rerank) ---
+    if path.rstrip("/") == "/invoke" and http_method == "POST":
+        try:
+            body = json.loads(event.get("body") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return deny_response("invalid JSON body", status_code=400)
+        return handle_invoke(principal_id, identity_fields, body, request_id)
+
 
     # --- Inference pipeline (POST /converse or root) ---
     if http_method != "POST":
@@ -2340,23 +2715,16 @@ def lambda_handler(event: dict, context) -> dict:
         return deny_response("modelId is required", status_code=400)
 
     # -----------------------------------------------------------------------
-    # ALL /converse requests route through async path.
-    # API Gateway has a hard 29-second timeout. Rather than guessing which
-    # requests will exceed 29s (impossible to predict reliably), we route
-    # every request through the async pipeline (SQS → SFN → Fargate).
-    #
-    # Short requests: Fargate completes in 1-10s, user polls once or twice.
-    # Long requests: Fargate takes 30-300s, user polls until done.
-    # Result: zero 504 timeouts, regardless of model or input size.
-    #
-    # Trade-off: ~5-15s additional latency for short requests due to
-    # SQS → Dispatcher → SFN → Fargate cold start. Acceptable for
-    # a quota-managed gateway where reliability > latency.
+    # Smart routing: sync first, async for large requests or throttle fallback.
+    # All models start sync. Large input/output → async from the start.
+    # Sync fallback (SyncFallbackError) → automatic async fallback.
     # -----------------------------------------------------------------------
-    log_structured("info", "async_routing_all",
-                   request_id=request_id, principal_id=principal_id,
-                   model_id=model_id, reason="all_requests_async")
-    return handle_converse_job_submit(principal_id, identity_fields, body, request_id)
+    should_async, async_reason = _should_route_async(model_id, body)
+    if should_async:
+        log_structured("info", "async_routing",
+                       request_id=request_id, principal_id=principal_id,
+                       model_id=model_id, reason=async_reason)
+        return handle_converse_job_submit(principal_id, identity_fields, body, request_id)
 
     # Variables for ledger entry (populated as pipeline progresses)
     decision = "DENY"
@@ -2442,10 +2810,10 @@ def lambda_handler(event: dict, context) -> dict:
                            usage=quota_result["usage"],
                            limit=quota_result["limit"])
 
-            hard_cap = int(policy.get("max_monthly_cost_limit_krw", 2000000))
+            hard_cap = int(policy.get("max_monthly_cost_limit_krw", 5000000))
             effective = int(quota_result["limit"]["cost_krw"])
             usage_krw = quota_result["usage"]["cost_krw"]
-            band_size = 500000
+            band_size = _get_boost_increment(effective)
             band_floor = max(0, effective - band_size)
             can_request_more = (effective + band_size) <= hard_cap
             has_pending = False
@@ -2482,6 +2850,9 @@ def lambda_handler(event: dict, context) -> dict:
             else:
                 resp_body["message"] = "월간 최대 한도에 도달하여 추가 증액이 불가합니다."
 
+            # Send exhaustion email with increase request link (replaces _auto_create_approval_request)
+            _send_exhaustion_email(principal_id, policy, usage_krw, effective)
+
             return _response(429, resp_body)
 
         # Step 7: Bedrock Converse invocation (Req 6.1-6.4)
@@ -2493,6 +2864,13 @@ def lambda_handler(event: dict, context) -> dict:
             log_structured("warning", "model_not_converse",
                            request_id=request_id, model_id=model_id)
             return deny_response(denial_reason, status_code=400)
+        except SyncFallbackError as e:
+            # Sync failed (throttle or timeout) → fallback to async path
+            log_structured("warning", "sync_fallback_to_async",
+                           request_id=request_id, model_id=model_id,
+                           error=str(e))
+            return handle_converse_job_submit(
+                principal_id, identity_fields, body, request_id)
         except Exception as e:
             denial_reason = f"bedrock invocation failed: {str(e)}"
             log_structured("error", "bedrock_failed",
@@ -2634,3 +3012,716 @@ def lambda_handler(event: dict, context) -> dict:
             except Exception:
                 log_structured("error", "deny_ledger_write_failed",
                                request_id=request_id, alarm=True)
+
+
+# ===========================================================================
+# /invoke route — InvokeModel passthrough (image / embedding / rerank)
+# ===========================================================================
+# ISOLATED MODULE — does not modify any existing function or route.
+# Independent helpers (prefixed with _invoke_) and one route handler
+# (handle_invoke) are appended at the bottom of this file.
+#
+# Existing /converse, /converse-jobs, /longrun/*, /quota/status, /approval/*,
+# ConverseStream, write_request_ledger, update_monthly_usage are NOT modified.
+#
+# RequestLedger contract preserved (immutable, append-only):
+#   - /invoke writes a single PutItem to RequestLedger AFTER successful
+#     settlement (matches existing /converse contract). No Update/Delete
+#     ever performed on RequestLedger.
+#
+# Idempotency contract (request_id-based) — uses existing IdempotencyRecord
+# table which is purpose-built for this and already permits Update/Delete:
+#   1. IN_PROGRESS claim — conditional PutItem on IdempotencyRecord
+#      (request_id MUST NOT exist). Bedrock invoked only on success.
+#   2. COMPLETED commit — TransactWriteItems atomically:
+#        - IdempotencyRecord UpdateItem (IN_PROGRESS → COMPLETED, conditional)
+#        - MonthlyUsage UpdateItem (cost/usage ADD)
+#      RequestLedger PutItem happens AFTER successful transaction (immutable).
+#   3. FAILED — IdempotencyRecord UpdateItem (IN_PROGRESS → FAILED).
+#      MonthlyUsage NOT incremented. RequestLedger DENY entry written
+#      (existing pattern from /converse).
+#   4. Duplicate request_id (already present) → no Bedrock re-invocation:
+#        - COMPLETED → cached response read from IdempotencyRecord
+#        - IN_PROGRESS → 409 with retry_after
+#        - FAILED → 409 with hint to retry with new request_id
+# ===========================================================================
+
+# Allowlist — only these models are accepted on /invoke (gateway-level gate).
+_INVOKE_ALLOWLIST = frozenset({
+    # Image generation (17)
+    "stability.sd3-5-large-v1:0",
+    "stability.stable-image-core-v1:1",
+    "stability.stable-image-ultra-v1:1",
+    "stability.stable-conservative-upscale-v1:0",
+    "stability.stable-creative-upscale-v1:0",
+    "stability.stable-fast-upscale-v1:0",
+    "stability.stable-image-control-sketch-v1:0",
+    "stability.stable-image-control-structure-v1:0",
+    "stability.stable-image-erase-object-v1:0",
+    "stability.stable-image-inpaint-v1:0",
+    "stability.stable-image-remove-background-v1:0",
+    "stability.stable-image-search-recolor-v1:0",
+    "stability.stable-image-search-replace-v1:0",
+    "stability.stable-image-style-guide-v1:0",
+    "stability.stable-outpaint-v1:0",
+    "stability.stable-style-transfer-v1:0",
+    "amazon.titan-image-generator-v2:0",
+    "amazon.nova-canvas-v1:0",
+    # Video generation (1)
+    "luma.ray-v2:0",
+    # Embedding (6)
+    "amazon.titan-embed-text-v2:0",
+    "amazon.titan-embed-text-v1",
+    "amazon.titan-embed-g1-text-02",
+    "amazon.titan-embed-image-v1",
+    "cohere.embed-english-v3",
+    "cohere.embed-multilingual-v3",
+    # Rerank (2)
+    "amazon.rerank-v1:0",
+    "cohere.rerank-v3-5:0",
+})
+
+_INVOKE_IMAGE_MODELS = frozenset({
+    "stability.sd3-5-large-v1:0",
+    "stability.stable-image-core-v1:1",
+    "stability.stable-image-ultra-v1:1",
+    "stability.stable-conservative-upscale-v1:0",
+    "stability.stable-creative-upscale-v1:0",
+    "stability.stable-fast-upscale-v1:0",
+    "stability.stable-image-control-sketch-v1:0",
+    "stability.stable-image-control-structure-v1:0",
+    "stability.stable-image-erase-object-v1:0",
+    "stability.stable-image-inpaint-v1:0",
+    "stability.stable-image-remove-background-v1:0",
+    "stability.stable-image-search-recolor-v1:0",
+    "stability.stable-image-search-replace-v1:0",
+    "stability.stable-image-style-guide-v1:0",
+    "stability.stable-outpaint-v1:0",
+    "stability.stable-style-transfer-v1:0",
+    "amazon.titan-image-generator-v2:0",
+    "amazon.nova-canvas-v1:0",
+    "luma.ray-v2:0",
+})
+_INVOKE_EMBEDDING_MODELS = frozenset({
+    "amazon.titan-embed-text-v2:0",
+    "amazon.titan-embed-text-v1",
+    "amazon.titan-embed-g1-text-02",
+    "amazon.titan-embed-image-v1",
+    "cohere.embed-english-v3",
+    "cohere.embed-multilingual-v3",
+})
+_INVOKE_RERANK_MODELS = frozenset({
+    "amazon.rerank-v1:0",
+    "cohere.rerank-v3-5:0",
+})
+
+_INVOKE_IDEMPOTENCY_TTL_SECONDS = 24 * 3600
+_INVOKE_PENDING_RETRY_AFTER_SECONDS = 30
+
+
+def _invoke_classify_modal(model_id: str) -> str:
+    """Return 'image' | 'embedding' | 'rerank' | '' (unsupported)."""
+    if model_id in _INVOKE_IMAGE_MODELS:
+        return "image"
+    if model_id in _INVOKE_EMBEDDING_MODELS:
+        return "embedding"
+    if model_id in _INVOKE_RERANK_MODELS:
+        return "rerank"
+    return ""
+
+
+def _invoke_extract_usage(model_id: str, request_body: dict,
+                          response_body: dict) -> dict:
+    """Return {"unit": str, "count": int} or {} on failure (caller must deny).
+
+    Deterministic extraction from official Bedrock response shapes.
+    """
+    modal = _invoke_classify_modal(model_id)
+    try:
+        if modal == "image":
+            images = response_body.get("images") if isinstance(response_body, dict) else None
+            if not isinstance(images, list) or len(images) <= 0:
+                return {}
+            return {"unit": "per_image", "count": len(images)}
+
+        if modal == "embedding":
+            tok = response_body.get("inputTextTokenCount") if isinstance(response_body, dict) else None
+            if not isinstance(tok, (int, float)) or tok <= 0:
+                return {}
+            return {"unit": "input_tokens", "count": int(tok)}
+
+        if modal == "rerank":
+            # Rerank: count documents from request (deterministic)
+            docs = (request_body or {}).get("documents") or []
+            if isinstance(docs, list) and len(docs) > 0:
+                return {"unit": "per_doc", "count": len(docs)}
+            # Amazon Rerank uses 'sources' key
+            sources = (request_body or {}).get("sources") or []
+            if isinstance(sources, list) and len(sources) > 0:
+                return {"unit": "per_doc", "count": len(sources)}
+            return {}
+    except Exception:
+        return {}
+    return {}
+
+
+def _invoke_estimate_cost_krw(model_id: str, usage: dict,
+                              pricing_row: dict) -> Decimal:
+    """Compute KRW cost as Decimal. Returns Decimal('-1') on unit mismatch
+    or missing price (caller must deny — never accumulate 0)."""
+    if not usage or not pricing_row:
+        return Decimal("-1")
+    unit = usage.get("unit", "")
+    count = int(usage.get("count", 0))
+    if count <= 0:
+        return Decimal("-1")
+
+    pricing_unit = pricing_row.get("pricing_unit", "")
+
+    if unit == "per_image":
+        if pricing_unit not in ("per_image", ""):
+            return Decimal("-1")
+        per = pricing_row.get("per_image_price_krw")
+        if per is None:
+            per = pricing_row.get("per_image_krw")
+        if per is None:
+            return Decimal("-1")
+        return Decimal(str(per)) * Decimal(str(count))
+
+    if unit == "input_tokens":
+        per1k = pricing_row.get("input_price_per_1k")
+        if per1k is None:
+            return Decimal("-1")
+        return (Decimal(str(count)) * Decimal(str(per1k))) / Decimal("1000")
+
+    if unit == "per_doc":
+        # Rerank: per_doc_price_per_1k_krw or fallback to input_price_per_1k
+        per1k = pricing_row.get("per_doc_price_per_1k_krw")
+        if per1k is None:
+            per1k = pricing_row.get("input_price_per_1k")
+        if per1k is None:
+            return Decimal("-1")
+        return (Decimal(str(count)) * Decimal(str(per1k))) / Decimal("1000")
+
+    return Decimal("-1")
+
+
+def _invoke_lookup_pricing(model_id: str) -> dict:
+    """Direct GetItem on ModelPricing for /invoke. Returns {} if missing."""
+    if not TABLE_MODEL_PRICING:
+        return {}
+    try:
+        table = dynamodb.Table(TABLE_MODEL_PRICING)
+        resp = table.get_item(Key={"model_id": model_id})
+        return resp.get("Item") or {}
+    except Exception as e:
+        log_structured("error", "invoke_pricing_lookup_failed",
+                       model_id=model_id, error=str(e))
+        return {}
+
+
+_invoke_bedrock_client = None
+
+
+def _invoke_get_bedrock_client():
+    global _invoke_bedrock_client
+    if _invoke_bedrock_client is None:
+        from botocore.config import Config as BotoConfig
+        _invoke_bedrock_client = boto3.client(
+            "bedrock-runtime",
+            config=BotoConfig(
+                retries={"max_attempts": 0},
+                read_timeout=25,
+                connect_timeout=5,
+            ),
+        )
+    return _invoke_bedrock_client
+
+
+def _invoke_call_bedrock(model_id: str, body: dict) -> dict:
+    """Call bedrock-runtime.invoke_model and return parsed response body."""
+    client = _invoke_get_bedrock_client()
+    resp = client.invoke_model(
+        modelId=model_id,
+        body=json.dumps(body or {}),
+        contentType="application/json",
+        accept="application/json",
+    )
+    raw = resp["body"].read()
+    return json.loads(raw.decode("utf-8"))
+
+
+def _invoke_claim_in_progress(request_id: str, principal_id: str,
+                              model_id: str) -> str:
+    """Claim IN_PROGRESS in IdempotencyRecord via conditional PutItem.
+
+    Returns:
+      "claimed"   — claim succeeded; caller MAY invoke Bedrock
+      "duplicate" — request_id already exists; caller MUST handle duplicate
+    """
+    table = dynamodb.Table(TABLE_IDEMPOTENCY_RECORD)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    ttl_val = int(time.time()) + _INVOKE_IDEMPOTENCY_TTL_SECONDS
+    try:
+        table.put_item(
+            Item={
+                "request_id": request_id,
+                "route": "/invoke",
+                "status": "IN_PROGRESS",
+                "principal_id": principal_id,
+                "model_id": model_id,
+                "created_at": now_iso,
+                "ttl": ttl_val,
+            },
+            ConditionExpression="attribute_not_exists(request_id)",
+        )
+        return "claimed"
+    except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+        return "duplicate"
+
+
+def _invoke_get_idempotency_item(request_id: str) -> dict:
+    """Read IdempotencyRecord item by request_id. Returns {} if missing."""
+    try:
+        table = dynamodb.Table(TABLE_IDEMPOTENCY_RECORD)
+        resp = table.get_item(Key={"request_id": request_id})
+        return resp.get("Item") or {}
+    except Exception as e:
+        log_structured("error", "invoke_idempotency_get_failed",
+                       request_id=request_id, error=str(e))
+        return {}
+
+
+def _invoke_handle_duplicate(request_id: str) -> dict:
+    """Handle duplicate request_id by inspecting existing IdempotencyRecord."""
+    item = _invoke_get_idempotency_item(request_id)
+    if not item:
+        return _response(409, {
+            "decision": "DENY",
+            "denial_reason": "duplicate request_id but record disappeared",
+            "request_id": request_id,
+        })
+
+    route = item.get("route", "")
+    if route and route != "/invoke":
+        return _response(409, {
+            "decision": "DENY",
+            "denial_reason": "request_id already used on a different route",
+            "request_id": request_id,
+        })
+
+    status = item.get("status", "")
+    if status == "COMPLETED":
+        cached = item.get("cached_response", "")
+        if cached:
+            try:
+                if isinstance(cached, str):
+                    cached_body = json.loads(cached)
+                else:
+                    cached_body = cached
+                cached_body["duplicate_already_settled"] = True
+                return _response(200, cached_body)
+            except Exception:
+                pass
+        # Fallback minimal response
+        cost = item.get("cost_krw", 0)
+        return _response(200, {
+            "decision": "ALLOW",
+            "duplicate_already_settled": True,
+            "request_id": request_id,
+            "model_id": item.get("model_id", ""),
+            "usage": {
+                "unit": item.get("usage_unit", ""),
+                "count": int(item.get("usage_count", 0)),
+            },
+            "cost_krw": float(cost) if cost is not None else 0.0,
+            "note": "duplicate request_id — cached settlement returned",
+        })
+    if status == "IN_PROGRESS":
+        return _response(409, {
+            "decision": "DENY",
+            "denial_reason": "request already in progress",
+            "request_id": request_id,
+            "retry_after_seconds": _INVOKE_PENDING_RETRY_AFTER_SECONDS,
+        })
+    if status == "FAILED":
+        return _response(409, {
+            "decision": "DENY",
+            "denial_reason": "request previously failed — retry with a new request_id",
+            "request_id": request_id,
+        })
+    return _response(409, {
+        "decision": "DENY",
+        "denial_reason": f"request_id in unexpected state: {status}",
+        "request_id": request_id,
+    })
+
+
+def _invoke_settle_transaction(request_id: str, principal_id: str,
+                               model_id: str, usage: dict,
+                               cost_krw: Decimal,
+                               cached_payload: dict) -> str:
+    """Atomically commit settlement.
+
+    TransactWriteItems:
+      - IdempotencyRecord Update: IN_PROGRESS → COMPLETED (with cached response)
+      - MonthlyUsage Update: ADD cost_krw + token counts
+
+    Returns: "settled" | "duplicate_already_settled" | "still_in_progress" | "failed"
+    """
+    # Use a dedicated low-level dynamodb client (avoids resource serializer
+    # interfering with typed-dict expression values inside TransactWriteItems).
+    client = boto3.client("dynamodb", region_name=os.environ.get(
+        "AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-west-2")))
+    month = current_month_kst()
+    pk = f"{principal_id}#{month}"
+    ttl_val = end_of_month_ttl_kst()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    in_tok = usage["count"] if usage.get("unit") == "input_tokens" else 0
+    out_tok = 0
+
+    try:
+        client.transact_write_items(TransactItems=[
+            {
+                "Update": {
+                    "TableName": TABLE_IDEMPOTENCY_RECORD,
+                    "Key": {"request_id": {"S": request_id}},
+                    "UpdateExpression": (
+                        "SET #s = :completed, settled_at = :now, "
+                        "cost_krw = :c, usage_unit = :u, usage_count = :n, "
+                        "cached_response = :resp"
+                    ),
+                    "ConditionExpression": (
+                        "attribute_exists(request_id) AND #s = :in_progress "
+                        "AND #r = :inv_route"
+                    ),
+                    "ExpressionAttributeNames": {
+                        "#s": "status",
+                        "#r": "route",
+                    },
+                    "ExpressionAttributeValues": {
+                        ":completed": {"S": "COMPLETED"},
+                        ":in_progress": {"S": "IN_PROGRESS"},
+                        ":inv_route": {"S": "/invoke"},
+                        ":now": {"S": now_iso},
+                        ":c": {"N": str(cost_krw)},
+                        ":u": {"S": usage.get("unit", "")},
+                        ":n": {"N": str(int(usage.get("count", 0)))},
+                        ":resp": {"S": json.dumps(cached_payload, default=str)},
+                    },
+                }
+            },
+            {
+                "Update": {
+                    "TableName": TABLE_MONTHLY_USAGE,
+                    "Key": {
+                        "principal_id_month": {"S": pk},
+                        "model_id": {"S": model_id},
+                    },
+                    "UpdateExpression": (
+                        "ADD cost_krw :c, input_tokens :i, output_tokens :o "
+                        "SET #t = :ttl"
+                    ),
+                    "ExpressionAttributeNames": {"#t": "ttl"},
+                    "ExpressionAttributeValues": {
+                        ":c": {"N": str(cost_krw)},
+                        ":i": {"N": str(in_tok)},
+                        ":o": {"N": str(out_tok)},
+                        ":ttl": {"N": str(ttl_val)},
+                    },
+                }
+            },
+        ])
+        return "settled"
+    except Exception as e:
+        # TransactionCanceledException check via class name to avoid
+        # tightly coupling to a specific client instance.
+        cls_name = type(e).__name__
+        if cls_name == "TransactionCanceledException":
+            reasons = getattr(e, "response", {}).get("CancellationReasons", []) or []
+            codes = [r.get("Code", "") for r in reasons]
+            if codes and codes[0] == "ConditionalCheckFailed":
+                current = _invoke_get_idempotency_item(request_id)
+                cur_status = current.get("status", "")
+                if cur_status == "COMPLETED":
+                    return "duplicate_already_settled"
+                if cur_status == "IN_PROGRESS":
+                    return "still_in_progress"
+                return "failed"
+            log_structured("error", "invoke_settle_txn_cancelled",
+                           request_id=request_id, codes=codes, error=str(e),
+                           alarm=True)
+            return "failed"
+        log_structured("error", "invoke_settle_txn_error",
+                       request_id=request_id, error=str(e), alarm=True)
+        return "failed"
+
+
+def _invoke_mark_failed(request_id: str, reason: str) -> None:
+    """Best-effort IN_PROGRESS → FAILED in IdempotencyRecord."""
+    try:
+        table = dynamodb.Table(TABLE_IDEMPOTENCY_RECORD)
+        table.update_item(
+            Key={"request_id": request_id},
+            UpdateExpression=(
+                "SET #s = :failed, failed_at = :now, fail_reason = :r"
+            ),
+            ConditionExpression=(
+                "attribute_exists(request_id) AND #s = :in_progress "
+                "AND #rt = :inv_route"
+            ),
+            ExpressionAttributeNames={"#s": "status", "#rt": "route"},
+            ExpressionAttributeValues={
+                ":failed": "FAILED",
+                ":in_progress": "IN_PROGRESS",
+                ":inv_route": "/invoke",
+                ":now": datetime.now(timezone.utc).isoformat(),
+                ":r": reason[:512],
+            },
+        )
+    except Exception as e:
+        log_structured("error", "invoke_mark_failed_error",
+                       request_id=request_id, error=str(e), alarm=True)
+
+
+def _invoke_write_ledger(request_id: str, principal_id: str, model_id: str,
+                         decision: str, usage: dict, cost_krw,
+                         duration_ms: int, denial_reason: str = "") -> None:
+    """Append immutable RequestLedger record (PutItem only — preserves
+    existing /converse contract). Best-effort."""
+    try:
+        entry = {
+            "request_id": request_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "principal_id": principal_id,
+            "model_id": model_id,
+            "decision": decision,
+            "source_path": "/invoke",
+            "input_tokens": usage["count"] if usage.get("unit") == "input_tokens" else 0,
+            "output_tokens": 0,
+            "estimated_cost_krw": cost_krw if cost_krw is not None else Decimal("0"),
+            "duration_ms": duration_ms,
+        }
+        if usage.get("unit"):
+            entry["usage_unit"] = usage["unit"]
+            entry["usage_count"] = int(usage.get("count", 0))
+        if denial_reason:
+            entry["denial_reason"] = denial_reason[:512]
+        write_request_ledger(entry)
+    except Exception as e:
+        log_structured("error", "invoke_ledger_write_failed",
+                       request_id=request_id, error=str(e), alarm=True)
+
+
+def handle_invoke(principal_id: str, identity_fields: dict,
+                  body: dict, request_id: str) -> dict:
+    """POST /invoke — InvokeModel with idempotent, transactional settlement.
+
+    Pipeline:
+      1. Parse modelId + inner body
+      2. Allowlist gate
+      3. Pricing lookup (fail-closed)
+      4. PrincipalPolicy + per-principal allowed_models
+      5. Quota pre-check
+      6. IN_PROGRESS claim (conditional PutItem on IdempotencyRecord)
+         duplicate → return cached/409 (Bedrock NOT invoked)
+      7. Bedrock InvokeModel
+         failure → mark FAILED, ledger DENY, return error
+      8. Extract usage (fail-closed)
+         failure → mark FAILED, return settlement_failed
+      9. Compute cost (Decimal)
+     10. TransactWriteItems(COMPLETED + MonthlyUsage ADD)
+         settled → ledger ALLOW + 200 OK
+         duplicate_already_settled → return cached
+         still_in_progress → 409
+         failed → mark FAILED, return 500 settlement_failed
+    """
+    start_time = time.time()
+    model_id = body.get("modelId", "")
+    inner_body = body.get("body") or {}
+
+    if not model_id:
+        return deny_response("modelId is required", status_code=400)
+
+    # Step 2: allowlist
+    if model_id not in _INVOKE_ALLOWLIST:
+        log_structured("warning", "invoke_not_allowlisted",
+                       request_id=request_id, principal_id=principal_id,
+                       model_id=model_id)
+        return deny_response(
+            f"model {model_id} is not on /invoke allowlist", status_code=400)
+
+    # Step 3: pricing (fail-closed)
+    pricing_row = _invoke_lookup_pricing(model_id)
+    if not pricing_row:
+        return deny_response(f"no pricing defined for model {model_id}")
+
+    # Step 4: policy + per-principal allowed_models
+    try:
+        policy = lookup_principal_policy(principal_id)
+    except Exception as e:
+        log_structured("error", "invoke_policy_lookup_failed",
+                       request_id=request_id, error=str(e))
+        return deny_response("policy lookup failed")
+    if not policy:
+        return deny_response("no policy defined for principal")
+    if not check_model_access(policy, model_id):
+        return deny_response(f"model {model_id} not in allowed list")
+
+    # Step 5: quota pre-check
+    try:
+        quota_result = check_quota(principal_id, policy)
+    except Exception as e:
+        log_structured("error", "invoke_quota_check_failed",
+                       request_id=request_id, error=str(e))
+        return deny_response("quota check failed")
+    if not quota_result["allowed"]:
+        return _response(429, {
+            "decision": "DENY",
+            "denial_reason": "monthly cost quota exceeded",
+            "quota": quota_result,
+        })
+
+    # Step 6: IN_PROGRESS claim
+    claim = _invoke_claim_in_progress(request_id, principal_id, model_id)
+    if claim == "duplicate":
+        log_structured("info", "invoke_duplicate_request_id",
+                       request_id=request_id, principal_id=principal_id,
+                       model_id=model_id)
+        return _invoke_handle_duplicate(request_id)
+
+    # Step 7: Bedrock
+    try:
+        response_body = _invoke_call_bedrock(model_id, inner_body)
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        msg = f"bedrock_client_error:{code}"
+        log_structured("error", "invoke_bedrock_client_error",
+                       request_id=request_id, model_id=model_id, code=code,
+                       error=str(e), alarm=True)
+        _invoke_mark_failed(request_id, msg)
+        duration_ms = int((time.time() - start_time) * 1000)
+        _invoke_write_ledger(request_id, principal_id, model_id, "DENY",
+                             {}, None, duration_ms, msg)
+        return error_response(f"bedrock error: {code}")
+    except Exception as e:
+        msg = f"bedrock_failed:{str(e)[:200]}"
+        log_structured("error", "invoke_bedrock_failed",
+                       request_id=request_id, model_id=model_id, error=str(e),
+                       alarm=True)
+        _invoke_mark_failed(request_id, msg)
+        duration_ms = int((time.time() - start_time) * 1000)
+        _invoke_write_ledger(request_id, principal_id, model_id, "DENY",
+                             {}, None, duration_ms, msg)
+        return error_response(f"bedrock invocation failed: {str(e)[:200]}")
+
+    # Step 8: extract usage (fail-closed)
+    usage = _invoke_extract_usage(model_id, inner_body, response_body)
+    if not usage:
+        log_structured("error", "invoke_usage_extract_failed",
+                       request_id=request_id, model_id=model_id, alarm=True)
+        _invoke_mark_failed(request_id, "usage_extract_failed")
+        duration_ms = int((time.time() - start_time) * 1000)
+        _invoke_write_ledger(request_id, principal_id, model_id, "DENY",
+                             {}, None, duration_ms, "usage_extract_failed")
+        return _response(500, {
+            "decision": "DENY",
+            "denial_reason": "usage extraction failed — settlement_failed",
+            "request_id": request_id,
+        })
+
+    # Step 9: cost
+    cost_krw = _invoke_estimate_cost_krw(model_id, usage, pricing_row)
+    if cost_krw < Decimal("0"):
+        log_structured("error", "invoke_cost_compute_failed",
+                       request_id=request_id, model_id=model_id,
+                       usage_unit=usage.get("unit"),
+                       pricing_unit=pricing_row.get("pricing_unit"),
+                       alarm=True)
+        _invoke_mark_failed(request_id, "cost_compute_failed")
+        duration_ms = int((time.time() - start_time) * 1000)
+        _invoke_write_ledger(request_id, principal_id, model_id, "DENY",
+                             usage, None, duration_ms, "cost_compute_failed")
+        return _response(500, {
+            "decision": "DENY",
+            "denial_reason": "cost computation failed",
+            "request_id": request_id,
+        })
+
+    # Build cached payload — TWO versions:
+    #   - response_payload: full payload (output included) → returned to client
+    #   - cache_meta: metadata only (no output) → stored in IdempotencyRecord
+    # Reason: DynamoDB UpdateExpression has a 4KB size limit. Image models
+    # return base64 payloads >>4KB, which would blow up the transaction.
+    duration_ms = int((time.time() - start_time) * 1000)
+    new_usage_krw = Decimal(str(quota_result["usage"]["cost_krw"])) + cost_krw
+    remaining = max(Decimal("0"),
+                    Decimal(str(quota_result["limit"]["cost_krw"])) - new_usage_krw)
+
+    response_payload = {
+        "decision": "ALLOW",
+        "output": response_body,
+        "usage": {"unit": usage["unit"], "count": usage["count"]},
+        "cost_krw": float(cost_krw),
+        "remaining_quota_krw": float(remaining),
+        "model_id": model_id,
+        "request_id": request_id,
+    }
+    cache_meta = {
+        "decision": "ALLOW",
+        "usage": {"unit": usage["unit"], "count": usage["count"]},
+        "cost_krw": float(cost_krw),
+        "remaining_quota_krw": float(remaining),
+        "model_id": model_id,
+        "request_id": request_id,
+        "note": "duplicate request_id — output omitted (only metadata cached)",
+    }
+
+    # Step 10: transactional settle (uses lightweight cache_meta)
+    settle_result = _invoke_settle_transaction(
+        request_id, principal_id, model_id, usage, cost_krw, cache_meta)
+
+    if settle_result == "duplicate_already_settled":
+        log_structured("warning", "invoke_settle_already_settled",
+                       request_id=request_id, model_id=model_id)
+        return _invoke_handle_duplicate(request_id)
+
+    if settle_result == "still_in_progress":
+        log_structured("warning", "invoke_settle_still_in_progress",
+                       request_id=request_id, model_id=model_id)
+        return _response(409, {
+            "decision": "DENY",
+            "denial_reason": "settlement conflict — still IN_PROGRESS",
+            "request_id": request_id,
+        })
+
+    if settle_result != "settled":
+        log_structured("error", "invoke_settlement_failed",
+                       request_id=request_id, principal_id=principal_id,
+                       model_id=model_id,
+                       usage_unit=usage.get("unit"),
+                       usage_count=usage.get("count"),
+                       cost_krw=str(cost_krw),
+                       alarm=True)
+        _invoke_mark_failed(request_id, "settlement_failed")
+        _invoke_write_ledger(request_id, principal_id, model_id, "DENY",
+                             usage, cost_krw, duration_ms,
+                             "settlement_failed")
+        return _response(500, {
+            "decision": "DENY",
+            "denial_reason": "settlement_failed — bedrock invoked but cost not recorded",
+            "request_id": request_id,
+        })
+
+    # Step 11: success — write ledger ALLOW (immutable, append-only)
+    _invoke_write_ledger(request_id, principal_id, model_id, "ALLOW",
+                         usage, cost_krw, duration_ms)
+
+    log_structured("info", "invoke_allowed",
+                   request_id=request_id, principal_id=principal_id,
+                   model_id=model_id,
+                   usage_unit=usage["unit"], usage_count=usage["count"],
+                   cost_krw=str(cost_krw), duration_ms=duration_ms)
+
+    return _response(200, response_payload)

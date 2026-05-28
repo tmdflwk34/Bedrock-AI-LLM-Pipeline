@@ -6,8 +6,8 @@ variable "bedrock_users" {
   description = "List of usernames for BedrockUser IAM roles"
   type        = list(string)
   default = [
-    "user01", "user10", "admin", "user18", "user07", "user14", "user08",
-    "user12", "user11", "intern", "user16", "user02", "user19", "user05",
+    "user01", "bk86", "user10", "admin", "user18", "user07", "user14", "user08",
+    "user12", "user11", "hssim", "ihkim", "intern", "user16", "user02", "user19", "user05",
     "user04", "user21", "user09", "user22", "user15", "user17", "user13", "user20",
   ]
 }
@@ -16,25 +16,25 @@ variable "cluster_assume_role_arns" {
   description = "ParallelCluster role ARNs allowed to assume BedrockUser roles"
   type        = list(string)
   default = [
-    "arn:aws:iam::<ACCOUNT_ID>:role/<CLUSTER_ROLE>",
-    "arn:aws:iam::<ACCOUNT_ID>:role/parallelcluster/<CLUSTER_ROLE>",
-    "arn:aws:iam::<ACCOUNT_ID>:role/parallelcluster/<CLUSTER_ROLE>",
-    "arn:aws:iam::<ACCOUNT_ID>:role/parallelcluster/<CLUSTER_ROLE>",
-    "arn:aws:iam::<ACCOUNT_ID>:role/parallelcluster/<CLUSTER_ROLE>",
-    "arn:aws:iam::<ACCOUNT_ID>:role/parallelcluster/<CLUSTER_ROLE>",
-    "arn:aws:iam::<ACCOUNT_ID>:role/parallelcluster/<CLUSTER_ROLE>",
-    "arn:aws:iam::<ACCOUNT_ID>:role/parallelcluster/<CLUSTER_ROLE>",
-    "arn:aws:iam::<ACCOUNT_ID>:role/parallelcluster/<CLUSTER_ROLE>",
-    "arn:aws:iam::<ACCOUNT_ID>:role/parallelcluster/<CLUSTER_ROLE>",
-    "arn:aws:iam::<ACCOUNT_ID>:role/parallelcluster/<CLUSTER_ROLE>",
-    "arn:aws:iam::<ACCOUNT_ID>:role/parallelcluster/<CLUSTER_ROLE>",
+    "arn:aws:iam::123456789012:role/acme-ora-RoleHeadNode-NoBedrock",
+    "arn:aws:iam::123456789012:role/parallelcluster/acme-ora/acme-ora-RoleHeadNode-EXAMPLE",
+    "arn:aws:iam::123456789012:role/parallelcluster/acme-ora/acme-ora-ComputeFleetQueuesNe-RoleEXAMPLE",
+    "arn:aws:iam::123456789012:role/parallelcluster/acme-ora/acme-ora-ComputeFleetQueuesNe-RoleEXAMPLE",
+    "arn:aws:iam::123456789012:role/parallelcluster/acme-ora/acme-ora-ComputeFleetQueuesNe-RoleEXAMPLE",
+    "arn:aws:iam::123456789012:role/parallelcluster/acme-ora/acme-ora-ComputeFleetQueuesNe-RoleEXAMPLE",
+    "arn:aws:iam::123456789012:role/parallelcluster/acme-ora/acme-ora-ComputeFleetQueuesNe-RoleEXAMPLE",
+    "arn:aws:iam::123456789012:role/parallelcluster/acme-ora/acme-ora-ComputeFleetQueuesNe-RoleEXAMPLE",
+    "arn:aws:iam::123456789012:role/parallelcluster/acme-ora/acme-ora-ComputeFleetQueuesNe-RoleD4a04feab6af0c39-NQldLulTWEGn",
+    "arn:aws:iam::123456789012:role/parallelcluster/acme-ora/acme-ora-ComputeFleetQueuesNe-RoleE023cc478a73ac4b-t59JrlvQNSsR",
+    "arn:aws:iam::123456789012:role/parallelcluster/acme-ora/acme-ora-ComputeFleetQueuesNe-RoleE9d20843b98a0ad6-9o5EnlM6C07N",
+    "arn:aws:iam::123456789012:role/parallelcluster/acme-ora/acme-ora-ComputeFleetQueuesNe-RoleFddf5a48e958cde0-PnbZiKu1235l",
   ]
 }
 
 variable "discovery_api_id" {
   description = "Discovery API Gateway ID"
   type        = string
-  default     = "<DISCOVERY_API_ID>"
+  default     = "ugpt5xi8b7"
 }
 
 # --- Role ---
@@ -44,11 +44,35 @@ resource "aws_iam_role" "bedrock_user" {
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { AWS = var.cluster_assume_role_arns }
-      Action    = "sts:AssumeRole"
-    }]
+    Statement = concat(
+      [{
+        Effect    = "Allow"
+        Principal = { AWS = var.cluster_assume_role_arns }
+        Action    = "sts:AssumeRole"
+      }],
+      # SSO trust — allows IAM Identity Center users to assume their own role
+      [{
+        Effect    = "Allow"
+        Principal = { AWS = "arn:aws:iam::123456789012:root" }
+        Action    = "sts:AssumeRole"
+        Condition = {
+          ArnLike = {
+            "aws:PrincipalArn" = "arn:aws:iam::123456789012:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_*"
+          }
+        }
+      }],
+      # Add IAM Roles Anywhere statement for DGX pilot users only
+      var.enable_dgx_onprem_access && contains(var.dgx_pilot_users, each.key) ? [{
+        Effect    = "Allow"
+        Principal = { Service = "rolesanywhere.amazonaws.com" }
+        Action    = ["sts:AssumeRole", "sts:SetSourceIdentity", "sts:TagSession"]
+        Condition = {
+          ArnEquals = {
+            "aws:SourceArn" = aws_rolesanywhere_trust_anchor.dgx[0].arn
+          }
+        }
+      }] : []
+    )
   })
 
   tags = {
@@ -134,6 +158,23 @@ resource "aws_iam_role_policy" "bedrock_user_gw_converse" {
       Effect   = "Allow"
       Action   = "execute-api:Invoke"
       Resource = "arn:aws:execute-api:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${aws_api_gateway_rest_api.gateway.id}/${var.api_gateway_stage_name}/POST/converse"
+    }]
+  })
+}
+
+# /invoke route — InvokeModel passthrough for image / embedding / rerank.
+# Synchronous only; allowlist enforced at the gateway Lambda.
+resource "aws_iam_role_policy" "bedrock_user_gw_invoke" {
+  for_each = toset(var.bedrock_users)
+  name     = "AllowDevGatewayInvoke"
+  role     = aws_iam_role.bedrock_user[each.key].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "execute-api:Invoke"
+      Resource = "arn:aws:execute-api:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${aws_api_gateway_rest_api.gateway.id}/${var.api_gateway_stage_name}/POST/invoke"
     }]
   })
 }
@@ -228,6 +269,21 @@ resource "aws_iam_role_policy" "bedrock_user_gw_longrun" {
       Effect   = "Allow"
       Action   = "execute-api:Invoke"
       Resource = "arn:aws:execute-api:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${aws_api_gateway_rest_api.gateway.id}/${var.api_gateway_stage_name}/POST/longrun/*"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "bedrock_user_gw_stream" {
+  for_each = toset(var.bedrock_users)
+  name     = "AllowStreamFunctionUrl"
+  role     = aws_iam_role.bedrock_user[each.key].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "lambda:InvokeFunctionUrl"
+      Resource = aws_lambda_function.stream_handler.arn
     }]
   })
 }
