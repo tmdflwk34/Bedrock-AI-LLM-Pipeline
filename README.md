@@ -5,9 +5,39 @@ AWS Bedrock 모델 사용을 중앙 정책으로 통제하는 `Bedrock Gateway`�
 
 ## Architecture Overview
 
-![Bedrock Gateway architecture overview](./docs/assets/bedrock-gateway/bedrock-gateway-architecture-overview.png)
+### 아키텍쳐 정의
 
-이 저장소의 아키텍처는 `260310_Bedrock Gateway 기반 모델 사용 아키텍처` 발표 자료를 바탕으로 정리되었으며, 현재 구현/배포 구조 기준으로 다음 흐름을 따릅니다.
+![Bedrock Gateway 아키텍쳐 정의](./docs/assets/bedrock-gateway/bedrock-gateway-architecture-definition.png)
+
+게이트웨이는 전면 승인제가 아닌 **Self-Service + 예외 승인** 모델입니다.
+사용자는 IAM Identity Center SSO와 기존 CLI/SDK 프로필을 그대로 사용하고, Quota 이내에서는 별도 승인 없이 즉시 모델을 호출합니다.
+Quota 초과분과 예외 사항만 승인 대상이며, 승인 UI는 기존 계정관리 포털을 재사용합니다.
+역할은 `Gateway`(정책 집행 / Runtime), `Portal`(승인 처리 / Workflow), `SES`(알림 채널)로 분리됩니다.
+
+### 아키텍쳐 전체 Flow
+
+![Bedrock Gateway 아키텍쳐 전체 Flow](./docs/assets/bedrock-gateway/bedrock-gateway-architecture-full-flow.png)
+
+End Users / Identity & Access / Approval System / Central AI Gateway Account 네 영역으로 구성되며, 전체 리소스는 Terraform(IaC)으로 관리됩니다.
+
+### 아키텍쳐 순서
+
+![Bedrock Gateway 아키텍쳐 순서](./docs/assets/bedrock-gateway/bedrock-gateway-architecture-sequence.png)
+
+| 단계 | 동작 | 설명 |
+|---|---|---|
+| 1 | SSO 로그인 | IAM Identity Center를 통해 사용자 인증 수행 |
+| 2 | 자격증명 획득 | `~/.aws/config` 프로필 기반 Permission Set assume role 자격증명 |
+| 3 | API 호출 | API Gateway REST API 호출 |
+| 4 | 사용자 식별 | Lambda가 호출자의 Identity Center User 확인 |
+| 5 | Quota/정책 확인 | DynamoDB에서 사용자별 모델 일일 한도, 모델 권한 조회 및 차감 |
+| 6 | Bedrock 호출 | Converse, InvokeModel API로 Bedrock Runtime 호출 |
+| 7 | 응답 반환 | 스트리밍 또는 단건 응답을 전달 |
+| 8 | 로깅 | CloudWatch 및 Bedrock Invocation Logging 기록 |
+
+### 구현 기준 흐름
+
+현재 구현/배포 구조 기준으로 다음 흐름을 따릅니다.
 
 1. 사용자는 `IAM Identity Center` 기반으로 인증합니다.
 2. 모델 호출은 `API Gateway`와 `Lambda Gateway`를 통해서만 진입합니다. 직접 Bedrock 호출은 IAM 정책으로 차단됩니다.
