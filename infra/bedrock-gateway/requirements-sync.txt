@@ -1,0 +1,6 @@
+boto3
+botocore
+hypothesis
+pytest
+moto[dynamodb,s3,ses]
+responses

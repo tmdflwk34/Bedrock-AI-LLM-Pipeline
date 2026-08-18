@@ -44,6 +44,28 @@ resource "aws_iam_role_policy" "bedrock" {
         "bedrock:InvokeModelWithResponseStream",
       ]
       Resource = ["*"]
+      },
+      # Additive grant for the bedrock-mantle OpenAI Responses endpoint.
+      # LIVE-CONFIRMED (2026-06): the mantle Responses API authorizes via the
+      # NEW service namespace action `bedrock-mantle:CreateInference` on the
+      # account's mantle project resource — NOT bedrock:InvokeModel. The 25
+      # BedrockUser roles ALSO get a per-path execute-api:Invoke grant for
+      # POST /openai/responses (see bedrock_users.tf — execute-api perms are
+      # per-method/path, not wildcard). No static credential / per-user secret.
+      #
+      # ADDITIVE CHANGE — requires a TARGETED apply only (NEVER a full apply):
+      #   AWS_PROFILE=bedrock-gw terraform apply \
+      #     -target=aws_iam_role_policy.bedrock \
+      #     -target=aws_lambda_function.gateway \
+      #     -var-file=env/dev.tfvars -lock=false
+      {
+        Sid    = "BedrockMantleResponses"
+        Effect = "Allow"
+        Action = ["bedrock-mantle:CreateInference"]
+        Resource = [
+          "arn:aws:bedrock-mantle:us-west-2:123456789012:project/default",
+          "arn:aws:bedrock-mantle:us-east-2:123456789012:project/default",
+        ]
     }]
   })
 }
@@ -138,19 +160,49 @@ resource "aws_iam_role_policy" "ses" {
 }
 
 
-# Step Functions — start async job executions
+# Step Functions — start async job executions, and stop them when cancelled.
+#
+# StopExecution is what delivers the SIGTERM the worker's cancel handler runs on
+# (long-output-streaming task 5.3). Without it `handle_converse_job_cancel` still
+# answered 200 and still released the `__reserved__` hold, while the generation
+# ran to completion and settled against a hold that no longer existed — observed
+# live on job-542e9f20-ddb3-454a-86d0-3157f99eea3b (scenario 9.4, R9.1/R9.2/R7.5).
+# The leak window is the single-generation ceiling, so raising that 1800s → 7200s
+# made the same missing grant four times as expensive.
+#
+# Two statements, because the two actions authorize on different resource types
+# and one combined statement would have to widen both to cover either:
+#   StartExecution -> the state machine   arn:...:stateMachine:<name>
+#   StopExecution  -> an execution of it  arn:...:execution:<name>:<execution-id>
+# StopExecution granted on the state machine ARN is an AccessDenied at call time;
+# granted on "*" it would let this role stop any execution in the account. The
+# execution name is the job_id, hence the trailing `*`.
+#
+# The resource label and the policy `name` stay `sfn_start` on purpose: renaming
+# either would destroy and recreate the inline policy, and this change is meant
+# to be a pure action addition on the existing one.
 resource "aws_iam_role_policy" "sfn_start" {
   name = "${local.prefix}-sfn-start"
   role = aws_iam_role.lambda_exec.id
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Sid      = "StartJobExecution"
-      Effect   = "Allow"
-      Action   = ["states:StartExecution"]
-      Resource = [aws_sfn_state_machine.job_orchestrator.arn]
-    }]
+    Statement = [
+      {
+        Sid      = "StartJobExecution"
+        Effect   = "Allow"
+        Action   = ["states:StartExecution"]
+        Resource = [aws_sfn_state_machine.job_orchestrator.arn]
+      },
+      {
+        Sid    = "StopJobExecution"
+        Effect = "Allow"
+        Action = ["states:StopExecution"]
+        Resource = [
+          "arn:aws:states:${var.aws_region}:${data.aws_caller_identity.current.account_id}:execution:${aws_sfn_state_machine.job_orchestrator.name}:*",
+        ]
+      },
+    ]
   })
 }
 
@@ -182,6 +234,28 @@ resource "aws_iam_role_policy" "sqs_enqueue" {
       Effect   = "Allow"
       Action   = ["sqs:SendMessage"]
       Resource = [aws_sqs_queue.job_queue.arn]
+    }]
+  })
+}
+
+# =============================================================================
+# Fargate Task — Lambda Invoke (warning check after async settlement)
+# =============================================================================
+
+resource "aws_iam_role_policy" "fargate_task_lambda_invoke" {
+  name = "${local.prefix}-fargate-lambda-invoke"
+  role = aws_iam_role.fargate_task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "InvokeWarningCheckLambda"
+      Effect = "Allow"
+      Action = ["lambda:InvokeFunction"]
+      Resource = [
+        "arn:aws:lambda:${var.aws_region}:${data.aws_caller_identity.current.account_id}:function:${local.prefix}-gateway",
+        "arn:aws:lambda:${var.aws_region}:${data.aws_caller_identity.current.account_id}:function:${local.prefix}-gateway:live",
+      ]
     }]
   })
 }

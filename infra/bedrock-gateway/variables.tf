@@ -63,9 +63,15 @@ variable "bedrock_invocation_log_group_name" {
 }
 
 variable "discovery_mode" {
-  description = "Enable discovery mode for Task 3 principal normalization capture. Disable after discovery."
+  description = "Enable ry mode for Task 3 principal normalization capture. Disable after discovery."
   type        = bool
   default     = false
+}
+
+variable "fx_rate_krw_per_usd" {
+  description = "Fixed reference exchange rate (KRW per USD) used to derive KRW prices from USD source rates. Centralized single source of truth (R6.5)."
+  type        = string
+  default     = "1482.5"
 }
 
 variable "manage_api_gateway_account_cloudwatch_role" {
@@ -108,13 +114,48 @@ variable "fargate_security_group_ids" {
 }
 
 # =============================================================================
+# Worker Image Pinning (long-output-streaming 5.5, design.md U4)
+# =============================================================================
+#
+# Neither variable has a default, on purpose. A default would be the *dev*
+# registry's digest, and inheriting it in another environment produces a task
+# definition that cannot pull — discovered at the first job launch, not at plan
+# time. No default means terraform refuses to plan until the pin is stated for
+# the environment being deployed, which is the same fail-closed shape as
+# `ses_sender_email`. Both are set in `env/<environment>.tfvars`.
+
+variable "worker_image_digest" {
+  description = "Immutable digest of the worker container image, `sha256:<64 hex>`. Replaces the `:latest` tag so a task-definition revision identifies exactly one image (U4). Bump together with worker_source_commit."
+  type        = string
+
+  # A truncated or mistyped digest is otherwise only caught when a task tries
+  # to start (CannotPullContainerError), which is long after apply.
+  validation {
+    condition     = can(regex("^sha256:[0-9a-f]{64}$", var.worker_image_digest))
+    error_message = "worker_image_digest must be a full digest of the form sha256:<64 lowercase hex chars>."
+  }
+}
+
+variable "worker_source_commit" {
+  description = "Full 40-char git SHA of the source the pinned worker image was built from. Recorded as the task-definition `SourceCommit` tag and the container's `org.opencontainers.image.revision` label so a rollback target is identifiable (U4)."
+  type        = string
+
+  # Full SHA only: an abbreviated or placeholder value ('unknown', 'HEAD') would
+  # reintroduce exactly the provenance gap U4 describes.
+  validation {
+    condition     = can(regex("^[0-9a-f]{40}$", var.worker_source_commit))
+    error_message = "worker_source_commit must be a full 40-character lowercase git SHA."
+  }
+}
+
+# =============================================================================
 # v3: Queue/Scheduler Limits
 # =============================================================================
 
 variable "global_active_limit" {
-  description = "Maximum concurrent active long-running jobs globally"
+  description = "Maximum concurrent active long-running jobs globally. 배포 실측값과 일치. 변경 시 HC1(≥50) 검증 필요"
   type        = number
-  default     = 20
+  default     = 1000
 }
 
 variable "per_user_active_limit" {
@@ -133,4 +174,27 @@ variable "per_user_queue_limit" {
   description = "Maximum queued jobs per user before rejecting new submissions"
   type        = number
   default     = 100
+}
+
+# =============================================================================
+# DGX On-Prem Gateway Access (IAM Roles Anywhere)
+# =============================================================================
+
+variable "enable_dgx_onprem_access" {
+  description = "Enable IAM Roles Anywhere resources for DGX on-prem gateway access"
+  type        = bool
+  default     = false
+}
+
+variable "dgx_ca_certificate_pem" {
+  description = "PEM-encoded CA certificate for the DGX gateway Trust Anchor"
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "dgx_pilot_users" {
+  description = "List of pilot usernames for DGX on-prem access (maps to BedrockUser-{username} roles)"
+  type        = list(string)
+  default     = ["user08"]
 }

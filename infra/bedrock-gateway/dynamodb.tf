@@ -363,10 +363,27 @@ resource "aws_dynamodb_table" "job_state" {
     type = "S"
   }
 
+  # Sparse-GSI marker attribute (batch). Present (value "1") only on active
+  # batch items and REMOVED at settlement/terminal, so existing items never
+  # carry it and never appear in the index — existing behavior unchanged.
+  attribute {
+    name = "gsi_batch_active"
+    type = "S"
+  }
+
   global_secondary_index {
     name            = "principal-created-index"
     hash_key        = "principal_id"
     range_key       = "created_at"
+    projection_type = "ALL"
+  }
+
+  # Sparse GSI for O(1) global active-batch counting (Select=COUNT). Only
+  # active batch items carry gsi_batch_active, so this index is sparse and
+  # does not include any pre-existing async job items (design §4.2).
+  global_secondary_index {
+    name            = "batch-active-index"
+    hash_key        = "gsi_batch_active"
     projection_type = "ALL"
   }
 

@@ -87,15 +87,38 @@ resource "aws_iam_role_policy" "bedrock_user_access" {
   name     = "BedrockAccess"
   role     = aws_iam_role.bedrock_user[each.key].id
 
+  # Resource scope is intentionally wide:
+  #
+  # 1. Every Bedrock foundation-model ARN (`foundation-model/*`) plus every
+  #    cross-region inference-profile ARN under this account is allowed at the
+  #    IAM layer. This guarantees that a brand-new vendor (deepseek, meta,
+  #    mistral, ai21, cohere, future-vendor) registered in the AWS Bedrock
+  #    catalog is callable through the gateway on the very next sync without
+  #    any IAM change — matching Req 1.5 ("the catalog is the sole authority
+  #    for callability").
+  #
+  # 2. Per-user model authorisation lives in DynamoDB
+  #    `bedrock-gw-<env>-<region>-principal-policy.allowed_models` and is
+  #    auto-populated by `scripts/auto_sync_models/` daily. That is the
+  #    precise gate; this IAM policy is only the broad gate that lets the
+  #    request reach the gateway Lambda in the first place.
+  #
+  # 3. Direct (off-gateway) Bedrock invocation is still blocked by the
+  #    sibling `DenyDirectBedrockInference` policy below, so widening the
+  #    Allow ARN here does NOT permit a user to bypass the gateway.
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
-        Effect   = "Allow"
-        Action   = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream", "bedrock:Converse", "bedrock:ConverseStream"]
+        Effect = "Allow"
+        Action = [
+          "bedrock:InvokeModel",
+          "bedrock:InvokeModelWithResponseStream",
+          "bedrock:Converse",
+          "bedrock:ConverseStream",
+        ]
         Resource = [
-          "arn:aws:bedrock:*::foundation-model/anthropic.claude*",
-          "arn:aws:bedrock:*::foundation-model/amazon.*",
+          "arn:aws:bedrock:*::foundation-model/*",
           "arn:aws:bedrock:*:${data.aws_caller_identity.current.account_id}:inference-profile/*",
         ]
       },
@@ -138,9 +161,9 @@ resource "aws_iam_role_policy" "bedrock_user_deny_ecs_sfn" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Sid    = "DenyDirectECSAndSFN"
-      Effect = "Deny"
-      Action = ["ecs:RunTask", "ecs:ExecuteCommand", "ecs:StartTask", "states:StartExecution", "states:StartSyncExecution"]
+      Sid      = "DenyDirectECSAndSFN"
+      Effect   = "Deny"
+      Action   = ["ecs:RunTask", "ecs:ExecuteCommand", "ecs:StartTask", "states:StartExecution", "states:StartSyncExecution"]
       Resource = "*"
     }]
   })
@@ -179,6 +202,72 @@ resource "aws_iam_role_policy" "bedrock_user_gw_invoke" {
   })
 }
 
+# /openai/responses route — OpenAI Responses API (bedrock-mantle) passthrough
+# for gpt-5.4 / gpt-5.5 / gpt-oss. Synchronous, buffered; allowlist + pricing +
+# quota enforced at the gateway Lambda. execute-api:Invoke is per-path, so this
+# distinct grant is required for the new route (the {proxy+} integration only
+# forwards the request; API Gateway still authorizes the exact method/path).
+resource "aws_iam_role_policy" "bedrock_user_gw_openai_responses" {
+  for_each = toset(var.bedrock_users)
+  name     = "AllowDevGatewayOpenAIResponses"
+  role     = aws_iam_role.bedrock_user[each.key].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "execute-api:Invoke"
+      Resource = "arn:aws:execute-api:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${aws_api_gateway_rest_api.gateway.id}/${var.api_gateway_stage_name}/POST/openai/responses"
+    }]
+  })
+}
+
+# /batch route family — Bedrock batch inference (bedrock-batch-inference-gateway).
+# submit (POST /batch), status (GET /batch/{job_id}). Per-path execute-api grants
+# (API Gateway authorizes the exact method/path even though the {proxy+}
+# integration forwards everything). Gateway-routed access is mandatory — this is
+# the per-user grant that lets BedrockUser roles reach the new /batch route.
+resource "aws_iam_role_policy" "bedrock_user_gw_batch" {
+  for_each = toset(var.bedrock_users)
+  name     = "AllowDevGatewayBatch"
+  role     = aws_iam_role.bedrock_user[each.key].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = "execute-api:Invoke"
+      Resource = [
+        "arn:aws:execute-api:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${aws_api_gateway_rest_api.gateway.id}/${var.api_gateway_stage_name}/POST/batch",
+        "arn:aws:execute-api:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${aws_api_gateway_rest_api.gateway.id}/${var.api_gateway_stage_name}/GET/batch/*",
+      ]
+    }]
+  })
+}
+
+# /openai/responses-jobs route family — async (long-running) Responses jobs.
+# submit (POST), status (GET /{id}), cancel (POST /{id}/cancel). Per-path
+# execute-api grants (API Gateway authorizes exact method/path even though the
+# {proxy+} integration forwards everything).
+resource "aws_iam_role_policy" "bedrock_user_gw_openai_responses_jobs" {
+  for_each = toset(var.bedrock_users)
+  name     = "AllowDevGatewayOpenAIResponsesJobs"
+  role     = aws_iam_role.bedrock_user[each.key].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = "execute-api:Invoke"
+      Resource = [
+        "arn:aws:execute-api:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${aws_api_gateway_rest_api.gateway.id}/${var.api_gateway_stage_name}/POST/openai/responses-jobs",
+        "arn:aws:execute-api:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${aws_api_gateway_rest_api.gateway.id}/${var.api_gateway_stage_name}/GET/openai/responses-jobs/*",
+        "arn:aws:execute-api:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${aws_api_gateway_rest_api.gateway.id}/${var.api_gateway_stage_name}/POST/openai/responses-jobs/*",
+      ]
+    }]
+  })
+}
+
 resource "aws_iam_role_policy" "bedrock_user_gw_converse_jobs" {
   for_each = toset(var.bedrock_users)
   name     = "AllowDevGatewayConverseJobs"
@@ -187,12 +276,39 @@ resource "aws_iam_role_policy" "bedrock_user_gw_converse_jobs" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect   = "Allow"
-      Action   = "execute-api:Invoke"
+      Effect = "Allow"
+      Action = "execute-api:Invoke"
       Resource = [
         "arn:aws:execute-api:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${aws_api_gateway_rest_api.gateway.id}/${var.api_gateway_stage_name}/POST/converse-jobs",
         "arn:aws:execute-api:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${aws_api_gateway_rest_api.gateway.id}/${var.api_gateway_stage_name}/GET/converse-jobs/*",
         "arn:aws:execute-api:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${aws_api_gateway_rest_api.gateway.id}/${var.api_gateway_stage_name}/POST/converse-jobs/*",
+      ]
+    }]
+  })
+}
+
+# /invoke-jobs route family — async (long-running) image InvokeModel jobs.
+# submit (POST /invoke-jobs), status (GET /invoke-jobs/{id}), cancel
+# (POST /invoke-jobs/{id}/cancel). Per-path execute-api grants (API Gateway
+# authorizes exact method/path even though the {proxy+} integration forwards
+# everything). Required so slow Stability image models (Creative/Conservative
+# Upscale) that the gateway hands off to async can be POLLED by the user
+# principal — without this, POST /invoke succeeds (submit is internal) but the
+# GET /invoke-jobs/* poll returns 403. Mirrors bedrock_user_gw_converse_jobs.
+resource "aws_iam_role_policy" "bedrock_user_gw_invoke_jobs" {
+  for_each = toset(var.bedrock_users)
+  name     = "AllowDevGatewayInvokeJobs"
+  role     = aws_iam_role.bedrock_user[each.key].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = "execute-api:Invoke"
+      Resource = [
+        "arn:aws:execute-api:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${aws_api_gateway_rest_api.gateway.id}/${var.api_gateway_stage_name}/POST/invoke-jobs",
+        "arn:aws:execute-api:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${aws_api_gateway_rest_api.gateway.id}/${var.api_gateway_stage_name}/GET/invoke-jobs/*",
+        "arn:aws:execute-api:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${aws_api_gateway_rest_api.gateway.id}/${var.api_gateway_stage_name}/POST/invoke-jobs/*",
       ]
     }]
   })
@@ -316,6 +432,31 @@ resource "aws_iam_role_policy" "bedrock_user_s3" {
       Effect   = "Allow"
       Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:GetBucketLocation"]
       Resource = ["arn:aws:s3:::*", "arn:aws:s3:::*/*"]
+    }]
+  })
+}
+
+# --- ReadOwnGatewayPolicy ---
+# Least-privilege self-service: each BedrockUser may read ONLY its own
+# principal-policy item (e.g. to check its own allowed_models). Row-level
+# isolation is enforced by dynamodb:LeadingKeys on the partition key.
+resource "aws_iam_role_policy" "bedrock_user_read_own_policy" {
+  for_each = toset(var.bedrock_users)
+  name     = "ReadOwnGatewayPolicy"
+  role     = aws_iam_role.bedrock_user[each.key].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "ReadOwnPrincipalPolicyItem"
+      Effect   = "Allow"
+      Action   = "dynamodb:GetItem"
+      Resource = aws_dynamodb_table.principal_policy.arn
+      Condition = {
+        "ForAllValues:StringEquals" = {
+          "dynamodb:LeadingKeys" = ["${data.aws_caller_identity.current.account_id}#BedrockUser-${each.key}"]
+        }
+      }
     }]
   })
 }

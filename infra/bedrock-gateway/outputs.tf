@@ -33,3 +33,26 @@ output "dynamodb_table_arns" {
     approval_pending_lock = aws_dynamodb_table.approval_pending_lock.arn
   }
 }
+
+# =============================================================================
+# DGX On-Prem Gateway Access (IAM Roles Anywhere)
+# =============================================================================
+
+output "dgx_trust_anchor_arn" {
+  description = "IAM Roles Anywhere Trust Anchor ARN for DGX on-prem access"
+  value       = var.enable_dgx_onprem_access ? aws_rolesanywhere_trust_anchor.dgx[0].arn : null
+}
+
+output "dgx_profile_arn" {
+  description = "IAM Roles Anywhere Profile ARN for DGX on-prem access"
+  value       = var.enable_dgx_onprem_access ? aws_rolesanywhere_profile.dgx[0].arn : null
+}
+
+# =============================================================================
+# Stream Lambda Function URL
+# =============================================================================
+
+output "stream_function_url" {
+  description = "Stream Lambda Function URL endpoint"
+  value       = aws_lambda_function_url.stream.function_url
+}

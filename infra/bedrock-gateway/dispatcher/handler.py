@@ -16,7 +16,7 @@ import boto3
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 
-GLOBAL_ACTIVE_LIMIT = int(os.environ.get('GLOBAL_ACTIVE_LIMIT', '20'))
+GLOBAL_ACTIVE_LIMIT = int(os.environ.get('GLOBAL_ACTIVE_LIMIT', '50'))
 TABLE_JOB_STATE = os.environ.get('TABLE_JOB_STATE', '')
 SFN_STATE_MACHINE_ARN = os.environ.get('SFN_STATE_MACHINE_ARN', '')
 SQS_QUEUE_URL = os.environ.get('SQS_QUEUE_URL', '')

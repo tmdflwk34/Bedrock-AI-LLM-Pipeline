@@ -17,6 +17,7 @@ resource "aws_lambda_function" "gateway" {
   memory_size      = var.lambda_memory_size
   filename         = data.archive_file.lambda_zip.output_path
   source_code_hash = data.archive_file.lambda_zip.output_base64sha256
+  publish          = true
 
   environment {
     variables = {
@@ -42,6 +43,9 @@ resource "aws_lambda_function" "gateway" {
       SES_SENDER_EMAIL            = var.ses_sender_email
       SES_ADMIN_GROUP_EMAIL       = var.ses_admin_group_email
       DISCOVERY_MODE              = tostring(var.discovery_mode)
+      FX_RATE_KRW_PER_USD         = tostring(var.fx_rate_krw_per_usd)
+      BATCH_BUCKET                = aws_s3_bucket.batch.bucket
+      BATCH_SERVICE_ROLE_ARN      = aws_iam_role.batch_service.arn
     }
   }
 
