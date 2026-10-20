@@ -292,6 +292,12 @@ Step Functions에서 override로 주입되는 변수:
 - `Dockerfile` — Python 3.12-slim + boto3
 
 ### 4. Backend Admin Routes (`account-portal/backend-admin/routes/`)
+
+관리자 JWT의 서명·검증 비밀값은 백엔드 프로세스의 `JWT_SECRET_KEY` 환경변수로
+외부에서 공급합니다. 로그인 포털과 Gateway 모듈에 동일한 값을 사용해야 합니다.
+키가 없거나 공백뿐이거나 이전에 공개된 기본값이면 모듈을 시작하지 않습니다.
+백엔드 `.env` 파일의 사후 로딩에 의존하지 말고 컨테이너 시작 전에 환경변수를
+전달하세요. 실제 값은 소스·Compose·환경파일에 커밋하지 않습니다.
 - `gateway_usage.py` — 사용량/정책/가격 조회 API
 - `gateway_teams.py` — 팀/사용자/관리자 관리 + IAM role 자동 프로비저닝
 - `gateway_approval.py` — 승인 요청/처리/이메일 발송

@@ -13,6 +13,7 @@ Req 11 (Admin Portal), Req 4 (Quota), Req 5 (Approval Ladder).
 """
 
 import os
+import hashlib
 import time
 import logging
 from functools import wraps
@@ -41,7 +42,14 @@ TABLE_MODEL_PRICING = f'{TABLE_PREFIX}-model-pricing'
 TABLE_TEMPORARY_QUOTA_BOOST = f'{TABLE_PREFIX}-temporary-quota-boost'
 TABLE_APPROVAL_PENDING_LOCK = f'{TABLE_PREFIX}-approval-pending-lock'
 
-JWT_SECRET_KEY = os.environ["JWT_SECRET_KEY"]
+JWT_SECRET_KEY = os.environ.get("JWT_SECRET_KEY")
+if (
+    not JWT_SECRET_KEY
+    or not JWT_SECRET_KEY.strip()
+    or hashlib.sha256(JWT_SECRET_KEY.encode("utf-8")).hexdigest()
+    == "cd10b8a868cf4a650ae2e5022ce51ba95e01161e2a13f4140d3263f83a8d74bb"
+):
+    raise RuntimeError("JWT_SECRET_KEY must be set to a non-empty, unexposed secret")
 HARD_CAP_KRW = 2000000
 BOOST_INCREMENT_KRW = 500000
 
