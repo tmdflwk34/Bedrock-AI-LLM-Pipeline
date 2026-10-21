@@ -6,3 +6,23 @@ tfplan
 .terraform.lock.hcl
 __pycache__/
 *.pyc
+
+# --- 보안: 실제 운영 데이터/백업/환경파일은 커밋하지 않는다 ---
+.env
+**/.env
+!**/.env.example
+mappings.json
+mapping.json
+*.backup
+*.backup.*
+*.backup_*
+*.bak
+*.bak.*
+*.bak_*
+*_backup_*
+*.old
+backups/
+*.pem
+*.key
+*.tfstate*
+docs/ai/discovery/*-evidence.json
